@@ -1,5 +1,6 @@
 import type { Type } from '@angular/core'
-import type { BaseNode, MarkdownIt, ParseOptions, ParsedNode } from 'stream-markdown-parser'
+import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
+import type { CodeBlockMonacoOptions, CodeBlockMonacoTheme } from '../../types/monaco'
 import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
 import { hydrateCustomTagContent } from '../../hydrateCustomTagContent'
 
@@ -20,9 +21,9 @@ export interface NodeRendererProps {
   customHtmlTags?: readonly string[]
   viewportPriority?: boolean
   codeBlockStream?: boolean
-  codeBlockDarkTheme?: any
-  codeBlockLightTheme?: any
-  codeBlockMonacoOptions?: Record<string, any>
+  codeBlockDarkTheme?: CodeBlockMonacoTheme
+  codeBlockLightTheme?: CodeBlockMonacoTheme
+  codeBlockMonacoOptions?: CodeBlockMonacoOptions
   renderCodeBlocksAsPre?: boolean
   codeBlockMinWidth?: string | number
   codeBlockMaxWidth?: string | number
@@ -32,7 +33,7 @@ export interface NodeRendererProps {
   infographicProps?: Record<string, any>
   customComponents?: Record<string, Type<any>>
   showTooltips?: boolean
-  themes?: string[]
+  themes?: CodeBlockMonacoTheme[]
   isDark?: boolean
   customId?: string
   indexKey?: number | string
@@ -55,6 +56,8 @@ export interface AngularRenderContext {
   indexKey?: string
   final?: boolean
   typewriter?: boolean
+  textStreamState?: Map<string, string>
+  streamRenderVersion?: number
   showTooltips?: boolean
   codeBlockStream?: boolean
   renderCodeBlocksAsPre?: boolean
@@ -68,10 +71,10 @@ export interface AngularRenderContext {
   infographicProps?: Record<string, any>
   customComponents?: Record<string, Type<any>>
   codeBlockThemes?: {
-    themes?: string[]
-    darkTheme?: any
-    lightTheme?: any
-    monacoOptions?: Record<string, any>
+    themes?: CodeBlockMonacoTheme[]
+    darkTheme?: CodeBlockMonacoTheme
+    lightTheme?: CodeBlockMonacoTheme
+    monacoOptions?: CodeBlockMonacoOptions
     minWidth?: string | number
     maxWidth?: string | number
   }
@@ -103,6 +106,8 @@ export const BLOCK_LEVEL_TYPES = new Set([
 export function buildRenderContext(
   props: NodeRendererProps,
   events: NodeRendererEvents = {},
+  textStreamState?: Map<string, string>,
+  streamRenderVersion?: number,
 ): AngularRenderContext {
   const customHtmlTags = normalizeCustomHtmlTags([
     ...(props.customHtmlTags || []),
@@ -115,6 +120,8 @@ export function buildRenderContext(
     indexKey: props.indexKey != null ? String(props.indexKey) : undefined,
     final: props.final,
     typewriter: props.typewriter,
+    textStreamState,
+    streamRenderVersion,
     showTooltips: props.showTooltips,
     codeBlockStream: props.codeBlockStream,
     renderCodeBlocksAsPre: props.renderCodeBlocksAsPre,
@@ -273,7 +280,7 @@ export function encodeDataPayload(value: string) {
   if (!value)
     return ''
 
-  const globalBuffer = (globalThis as any)?.Buffer
+  const globalBuffer = (globalThis as any)?.require?.('buffer')?.Buffer
   if (globalBuffer?.from)
     return globalBuffer.from(value, 'utf8').toString('base64')
 

@@ -1,3 +1,7 @@
+---
+description: 通过 MarkdownRender 的 props 精细控制流式渲染、暗色主题、自定义标签、解析选项与重节点行为。
+---
+
 # 组件 Props 与选项
 
 在集成 `markstream-vue` 时，常会需要微调流式行为、控制重节点渲染或避免 Tailwind/UnoCSS 样式冲突。本页提供对照表与排障提示。
@@ -51,6 +55,37 @@
 - `themes`（在安装 `stream-monaco` 时，会转发给其主题系统）
 
 注意：`code-block-monaco-options` 仅作用于 Monaco 版 `CodeBlockNode`。如果你把 `code_block` 覆盖成 `MarkdownCodeBlockNode`，此时 `code-block-dark-theme` / `code-block-light-theme` 应填写 Shiki 主题名，`themes` 为需要预加载的 Shiki 主题列表。
+
+只有 `ts twoslash` / `vue twoslash` 代码块才会在这个文档站里显示 hover 类型信息。更推荐 hover 下面对象里的字段，或者模板里的 `:code-block-monaco-options`，而不是只 hover 导入的类型名。
+
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockMonacoOptions } from 'markstream-vue'
+import MarkdownRender from 'markstream-vue'
+
+const md = '```ts\nconsole.log("hover monaco options")\n```'
+const monacoOptions = {
+  themes: ['vitesse-dark', 'vitesse-light'],
+  languages: ['typescript', 'vue', 'json'],
+  theme: 'vitesse-dark',
+  MAX_HEIGHT: 640,
+  diffHideUnchangedRegions: {
+    enabled: true,
+    contextLineCount: 2,
+  },
+  diffHunkActionsOnHover: true,
+  diffHunkHoverHideDelayMs: 240,
+} satisfies CodeBlockMonacoOptions
+</script>
+
+<template>
+  <MarkdownRender
+    custom-id="docs"
+    :content="md"
+    :code-block-monaco-options="monacoOptions"
+  />
+</template>
+```
 
 ## 图表节点全局下发参数
 

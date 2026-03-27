@@ -2,6 +2,10 @@
 
 使用 pnpm、npm 或 yarn 安装 markstream-react。
 
+::: tip 已经在用 react-markdown？
+如果你是从 `react-markdown` 迁过来，先看[迁移指南](/zh/guide/react-markdown-migration)获取整体路径，再看[迁移 Cookbook](/zh/guide/react-markdown-migration-cookbook)查具体场景。
+:::
+
 ```bash
 pnpm add markstream-react
 # 或
@@ -186,44 +190,28 @@ function App() {
 
 ## Next.js 集成
 
-对于 Next.js 项目，你需要确保组件仅在客户端渲染浏览器专属功能：
+在 Next.js 中，优先使用专门的 SSR 双入口：
 
 ```tsx
-'use client'
-
-import MarkdownRender from 'markstream-react'
-import { useEffect, useState } from 'react'
+import MarkdownRender from 'markstream-react/next'
 import 'markstream-react/index.css'
 
 export default function MarkdownPage() {
-  const [mounted, setMounted] = useState(false)
-
-  useEffect(() => {
-    setMounted(true)
-  }, [])
-
-  if (!mounted) {
-    return <div>加载中...</div>
-  }
-
-  return <MarkdownRender content="# Hello Next.js!" />
+  return <MarkdownRender content="# Hello Next.js!" final />
 }
 ```
 
-或使用 `'use client'` 指令配合动态导入：
+如果你需要一条纯 server、只输出稳定 fallback 的路径：
 
 ```tsx
-import dynamic from 'next/dynamic'
-
-const MarkdownRender = dynamic(
-  () => import('markstream-react').then(mod => mod.default),
-  { ssr: false }
-)
+import MarkdownRender from 'markstream-react/server'
 
 export default function MarkdownPage() {
-  return <MarkdownRender content="# Hello Next.js!" />
+  return <MarkdownRender content="# Hello Next.js!" final />
 }
 ```
+
+更完整的 App Router、Pages Router、自定义组件和验证说明见 [React Next SSR](/zh/guide/react-next-ssr)。
 
 ## Vite 集成
 

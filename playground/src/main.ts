@@ -6,6 +6,7 @@ import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 // import { VueRendererMarkdown } from '../../src/exports'
 import App from './App.vue'
+import { installPlaygroundSeo } from './seo'
 // import JsLocalIcon from './assets/javascript.svg?raw'
 import 'monaco-editor/min/vs/editor/editor.main.css'
 import '@unocss/reset/tailwind.css'
@@ -18,6 +19,7 @@ const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes,
 })
+installPlaygroundSeo(router)
 app.use(router)
 
 // Demo: override icons via plugin options (preferred)

@@ -1,15 +1,20 @@
 <script setup lang="ts">
+import type { TestLabFrameworkId, TestLabSampleId } from '../../../playground-shared/testLabFixtures'
+import type { SandboxFrameworkId, SandboxRenderSource } from '../../../playground-shared/versionSandbox'
+import type { StreamSliceMode } from '../composables/createLocalTextStream'
+import type { StreamPresetId } from '../composables/streamPresets'
+import type { StreamTransportMode } from '../composables/useStreamSimulator'
+import { Icon } from '@iconify/vue'
 import { useDebounceFn, useLocalStorage } from '@vueuse/core'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { TEST_LAB_FRAMEWORKS, TEST_LAB_SAMPLES } from '../../../playground-shared/testLabFixtures'
 import { decodeMarkdownHash, encodeMarkdownPayload, resolveFrameworkTestHref, withMarkdownHash } from '../../../playground-shared/testPageState'
 import {
   buildTestSandboxHref,
   normalizeSandboxSource,
   resolveSandboxSelection,
-  type SandboxFrameworkId,
-  type SandboxRenderSource,
+
 } from '../../../playground-shared/versionSandbox'
-import { TEST_LAB_FRAMEWORKS, TEST_LAB_SAMPLES, type TestLabFrameworkId, type TestLabSampleId } from '../../../playground-shared/testLabFixtures'
 import CodeBlockNode from '../../../src/components/CodeBlockNode'
 import { getUseMonaco } from '../../../src/components/CodeBlockNode/monaco'
 import MarkdownCodeBlockNode from '../../../src/components/MarkdownCodeBlockNode'
@@ -22,8 +27,11 @@ import KatexWorker from '../../../src/workers/katexRenderer.worker?worker&inline
 import { setKaTeXWorker } from '../../../src/workers/katexWorkerClient'
 import MermaidWorker from '../../../src/workers/mermaidParser.worker?worker&inline'
 import { setMermaidWorker } from '../../../src/workers/mermaidWorkerClient'
-import 'katex/dist/katex.min.css'
+import ThinkingNode from '../components/ThinkingNode.vue'
+import { CUSTOM_STREAM_PRESET_ID, findMatchingStreamPreset, getStreamPreset, STREAM_PRESETS } from '../composables/streamPresets'
+import { clampStreamControl, normalizeStreamRange, useStreamSimulator } from '../composables/useStreamSimulator'
 import { testSandboxFrameworks } from '../testSandboxConfig'
+import 'katex/dist/katex.min.css'
 
 type SampleId = TestLabSampleId
 type FrameworkId = TestLabFrameworkId
@@ -37,7 +45,7 @@ const diffHideUnchangedRegions = {
   enabled: true,
   contextLineCount: 2,
   minimumLineCount: 4,
-  revealLineCount: 2,
+  revealLineCount: 5,
 } as const
 
 const testPageMonacoOptions = {
@@ -53,11 +61,16 @@ const testPageMonacoOptions = {
 
 const selectedSampleId = useLocalStorage<SampleId>('vmr-test-sample', 'baseline')
 const input = ref<string>(sampleCards[0].content)
-const streamContent = ref<string>('')
-const isStreaming = ref(false)
-const streamSpeed = useLocalStorage<number>('vmr-test-stream-speed', 4)
-const streamInterval = useLocalStorage<number>('vmr-test-stream-interval', 24)
+const streamChunkSizeMin = useLocalStorage<number>('vmr-test-stream-chunk-size-min', 2)
+const streamChunkSizeMax = useLocalStorage<number>('vmr-test-stream-chunk-size-max', 7)
+const streamChunkDelayMin = useLocalStorage<number>('vmr-test-stream-delay-min', 14)
+const streamChunkDelayMax = useLocalStorage<number>('vmr-test-stream-delay-max', 34)
+const streamBurstiness = useLocalStorage<number>('vmr-test-stream-burstiness', 35)
+const streamTransportMode = useLocalStorage<StreamTransportMode>('vmr-test-stream-transport-mode', 'readable-stream')
+const streamSliceMode = useLocalStorage<StreamSliceMode>('vmr-test-stream-slice-mode', 'pure-random')
+const streamDebug = useLocalStorage<boolean>('vmr-test-stream-debug', false)
 const showStreamSettings = useLocalStorage<boolean>('vmr-test-show-settings', true)
+const isDark = useLocalStorage<boolean>('vmr-test-dark', false)
 
 const renderMode = useLocalStorage<'monaco' | 'pre' | 'markdown'>('vmr-test-render-mode', 'monaco')
 const codeBlockStream = useLocalStorage<boolean>('vmr-test-code-stream', true)
@@ -67,6 +80,7 @@ const typewriter = useLocalStorage<boolean>('vmr-test-typewriter', true)
 const debugParse = useLocalStorage<boolean>('vmr-test-debug-parse', false)
 const mathEnabled = useLocalStorage<boolean>('vmr-test-math-enabled', isKatexEnabled())
 const mermaidEnabled = useLocalStorage<boolean>('vmr-test-mermaid-enabled', isMermaidEnabled())
+const testPageCustomHtmlTags = ['think', 'thinking'] as const
 
 getUseMonaco()
 setKaTeXWorker(new KatexWorker())
@@ -79,15 +93,82 @@ const noticeType = ref<'success' | 'error' | 'info'>('success')
 const isWorking = ref(false)
 const isCopied = ref(false)
 const issueUrl = ref<string>('')
+const previewCardRef = ref<HTMLElement | null>(null)
+const isPreviewFullscreen = ref(false)
 const MAX_URL_LEN = 2000
 
 const activeSample = computed(() => sampleCards.find(sample => sample.id === selectedSampleId.value) ?? sampleCards[0])
+const normalizedChunkSizeRange = computed(() => normalizeStreamRange(
+  Number(streamChunkSizeMin.value),
+  Number(streamChunkSizeMax.value),
+  1,
+  80,
+  2,
+  7,
+))
+const normalizedChunkDelayRange = computed(() => normalizeStreamRange(
+  Number(streamChunkDelayMin.value),
+  Number(streamChunkDelayMax.value),
+  8,
+  600,
+  14,
+  34,
+))
+const {
+  content: streamContent,
+  chunks: streamChunks,
+  isPaused,
+  isStreaming,
+  lastChunkSize,
+  lastDelayMs,
+  reset: resetStreamState,
+  start: startStreaming,
+  stop: stopStreaming,
+  togglePause: toggleStreamingPause,
+} = useStreamSimulator({
+  source: input,
+  chunkSizeMin: computed(() => normalizedChunkSizeRange.value.min),
+  chunkSizeMax: computed(() => normalizedChunkSizeRange.value.max),
+  chunkDelayMin: computed(() => normalizedChunkDelayRange.value.min),
+  chunkDelayMax: computed(() => normalizedChunkDelayRange.value.max),
+  burstiness: computed(() => streamBurstiness.value / 100),
+  sliceMode: streamSliceMode,
+  transportMode: streamTransportMode,
+})
 const previewContent = computed(() => (isStreaming.value ? streamContent.value : input.value))
 const streamProgress = computed(() => {
   if (!input.value.length)
     return 0
   return Math.min(100, Math.round((previewContent.value.length / input.value.length) * 100))
 })
+const activeStreamPreset = computed(() => findMatchingStreamPreset({
+  chunkDelayMin: normalizedChunkDelayRange.value.min,
+  chunkDelayMax: normalizedChunkDelayRange.value.max,
+  chunkSizeMin: normalizedChunkSizeRange.value.min,
+  chunkSizeMax: normalizedChunkSizeRange.value.max,
+  burstiness: streamBurstiness.value,
+}))
+const selectedStreamPresetId = computed<StreamPresetId>({
+  get: () => activeStreamPreset.value?.id ?? CUSTOM_STREAM_PRESET_ID,
+  set: (presetId) => {
+    if (presetId === CUSTOM_STREAM_PRESET_ID)
+      return
+
+    const preset = getStreamPreset(presetId)
+    if (!preset)
+      return
+
+    streamChunkDelayMin.value = preset.chunkDelayMin
+    streamChunkDelayMax.value = preset.chunkDelayMax
+    streamChunkSizeMin.value = preset.chunkSizeMin
+    streamChunkSizeMax.value = preset.chunkSizeMax
+    streamBurstiness.value = preset.burstiness
+  },
+})
+const streamPresetDescription = computed(() => activeStreamPreset.value?.descriptionZh ?? '当前参数已偏离预设，属于自定义 min/max 流式画像。')
+const streamChunkRangeLabel = computed(() => `${normalizedChunkSizeRange.value.min}-${normalizedChunkSizeRange.value.max} 字`)
+const streamDelayRangeLabel = computed(() => `${normalizedChunkDelayRange.value.min}-${normalizedChunkDelayRange.value.max}ms`)
+const streamModeLabel = computed(() => streamTransportMode.value === 'readable-stream' ? 'ReadableStream' : 'Scheduler')
 const renderModeLabel = computed(() => {
   if (renderMode.value === 'markdown')
     return 'MarkdownCodeBlock'
@@ -95,6 +176,8 @@ const renderModeLabel = computed(() => {
     return 'PreCodeNode'
   return 'Monaco'
 })
+const previewDiagramMaxHeight = computed(() => isPreviewFullscreen.value ? 'none' : '500px')
+const previewD2MaxHeight = computed(() => 'none')
 const charCount = computed(() => input.value.length)
 const lineCount = computed(() => (input.value ? input.value.split('\n').length : 0))
 
@@ -133,11 +216,6 @@ const sandboxStatusLabel = computed(() => {
     return '待同步'
   return '已同步'
 })
-
-function clampInt(value: number, min: number, max: number, fallback: number) {
-  const normalized = Number.isFinite(value) ? Math.round(value) : fallback
-  return Math.min(max, Math.max(min, normalized))
-}
 
 function syncSandbox() {
   sandboxSnapshot.value = input.value
@@ -264,6 +342,29 @@ function openIssueInNewTab() {
   }
 }
 
+function syncPreviewFullscreenState() {
+  isPreviewFullscreen.value = document.fullscreenElement === previewCardRef.value
+}
+
+async function togglePreviewFullscreen() {
+  const previewCard = previewCardRef.value
+  if (!previewCard)
+    return
+
+  if (document.fullscreenElement === previewCard) {
+    if (!document.exitFullscreen)
+      return
+
+    await document.exitFullscreen()
+    return
+  }
+
+  if (!previewCard.requestFullscreen)
+    return
+
+  await previewCard.requestFullscreen()
+}
+
 function restoreFromUrl() {
   const decoded = decodeMarkdownHash(window.location.hash || '')
   if (!decoded)
@@ -285,40 +386,17 @@ function applySample(sampleId: SampleId) {
   showToast(`已切换到“${sample.title}”样例。`, 'info', 1200)
 }
 
-let streamTimer: number | null = null
-
-function scheduleNextChunk() {
-  if (!isStreaming.value)
-    return
-
-  const nextLength = Math.min(streamContent.value.length + streamSpeed.value, input.value.length)
-  streamContent.value = input.value.slice(0, nextLength)
-
-  if (nextLength >= input.value.length) {
-    stopStreamRender()
-    return
-  }
-
-  streamTimer = window.setTimeout(scheduleNextChunk, streamInterval.value)
-}
-
 function startStreamRender() {
   if (isStreaming.value) {
     stopStreamRender()
     return
   }
 
-  streamContent.value = ''
-  isStreaming.value = true
-  scheduleNextChunk()
+  startStreaming()
 }
 
 function stopStreamRender() {
-  if (streamTimer !== null) {
-    clearTimeout(streamTimer)
-    streamTimer = null
-  }
-  isStreaming.value = false
+  stopStreaming()
 }
 
 function resetEditor() {
@@ -326,8 +404,12 @@ function resetEditor() {
 }
 
 function clearEditor() {
-  stopStreamRender()
+  resetStreamState()
   input.value = ''
+}
+
+function toggleAppearance() {
+  isDark.value = !isDark.value
 }
 
 function frameworkHref(id: FrameworkId) {
@@ -352,18 +434,32 @@ onMounted(() => {
   }
   shareUrl.value = basePageUrl()
   sandboxSnapshot.value = input.value
+  syncPreviewFullscreenState()
+  document.addEventListener('fullscreenchange', syncPreviewFullscreenState)
 })
 
-watch(streamSpeed, (value) => {
-  const next = clampInt(value, 1, 80, 4)
-  if (next !== value)
-    streamSpeed.value = next
+onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', syncPreviewFullscreenState)
+})
+
+watch(normalizedChunkSizeRange, (range) => {
+  if (streamChunkSizeMin.value !== range.min)
+    streamChunkSizeMin.value = range.min
+  if (streamChunkSizeMax.value !== range.max)
+    streamChunkSizeMax.value = range.max
 }, { immediate: true })
 
-watch(streamInterval, (value) => {
-  const next = clampInt(value, 8, 300, 24)
+watch(normalizedChunkDelayRange, (range) => {
+  if (streamChunkDelayMin.value !== range.min)
+    streamChunkDelayMin.value = range.min
+  if (streamChunkDelayMax.value !== range.max)
+    streamChunkDelayMax.value = range.max
+}, { immediate: true })
+
+watch(streamBurstiness, (value) => {
+  const next = Math.round(clampStreamControl(value, 0, 100, 35))
   if (next !== value)
-    streamInterval.value = next
+    streamBurstiness.value = next
 }, { immediate: true })
 
 watch(input, () => {
@@ -402,11 +498,11 @@ watch(() => sandboxVersion.value, () => {
 
 watch(() => renderMode.value, (mode) => {
   if (mode === 'pre')
-    setCustomComponents({ code_block: PreCodeNode })
+    setCustomComponents({ code_block: PreCodeNode, think: ThinkingNode, thinking: ThinkingNode })
   else if (mode === 'markdown')
-    setCustomComponents({ code_block: MarkdownCodeBlockNode })
+    setCustomComponents({ code_block: MarkdownCodeBlockNode, think: ThinkingNode, thinking: ThinkingNode })
   else
-    setCustomComponents({ code_block: CodeBlockNode })
+    setCustomComponents({ code_block: CodeBlockNode, think: ThinkingNode, thinking: ThinkingNode })
 }, { immediate: true })
 
 watch(mathEnabled, (enabled) => {
@@ -425,7 +521,7 @@ watch(mermaidEnabled, (enabled) => {
 </script>
 
 <template>
-  <div class="test-lab">
+  <div class="test-lab" :class="{ 'test-lab--dark': isDark, 'dark': isDark }">
     <div class="test-lab__glow test-lab__glow--cyan" />
     <div class="test-lab__glow test-lab__glow--amber" />
 
@@ -435,8 +531,8 @@ watch(mermaidEnabled, (enabled) => {
           <span class="eyebrow">Cross-framework regression lab</span>
           <h1>Markstream Test Page</h1>
           <p>
-            用同一份 markdown，快速对照 Vue 3、Vue 2、React 和 Angular 的渲染行为。
-            这个页面更像一个调试驾驶舱，而不是单纯的 demo。
+            直接粘贴 markdown，即时预览渲染结果；需要排障时，再用同一份输入快速对照
+            Vue 3、Vue 2、React 和 Angular 的渲染行为。
           </p>
         </div>
 
@@ -503,7 +599,7 @@ watch(mermaidEnabled, (enabled) => {
             <div class="panel-card__head">
               <div>
                 <h2>流式控制</h2>
-                <p>模拟真实增量输出，检查闪烁和中间态。</p>
+                <p>模拟真实增量输出，把抖动、停顿和 burst 一起带进来。</p>
               </div>
               <button type="button" class="ghost-button" @click="showStreamSettings = !showStreamSettings">
                 {{ showStreamSettings ? '收起' : '展开' }}
@@ -513,6 +609,9 @@ watch(mermaidEnabled, (enabled) => {
             <div class="control-actions">
               <button type="button" class="action-button action-button--primary" @click="startStreamRender">
                 {{ isStreaming ? '停止流式渲染' : '开始流式渲染' }}
+              </button>
+              <button type="button" class="action-button" :disabled="!isStreaming" @click="toggleStreamingPause">
+                {{ isPaused ? '继续流式渲染' : '暂停流式渲染' }}
               </button>
               <button type="button" class="action-button" @click="resetEditor">
                 重置样例
@@ -528,22 +627,92 @@ watch(mermaidEnabled, (enabled) => {
               </div>
               <div class="progress-meta">
                 <span>{{ previewContent.length }} / {{ input.length || 0 }}</span>
-                <span>{{ isStreaming ? 'Streaming' : 'Static preview' }}</span>
+                <span>{{ isStreaming ? `${streamModeLabel} · 最近一次 ${lastChunkSize} 字 / ${lastDelayMs}ms` : 'Static preview' }}</span>
               </div>
             </div>
 
             <div v-if="showStreamSettings" class="control-stack">
+              <label class="select-control">
+                <span>Transport</span>
+                <select v-model="streamTransportMode">
+                  <option value="readable-stream">
+                    ReadableStream
+                  </option>
+                  <option value="scheduler">
+                    Scheduler
+                  </option>
+                </select>
+              </label>
+
+              <label class="select-control">
+                <span>Slice Mode</span>
+                <select v-model="streamSliceMode">
+                  <option value="pure-random">
+                    Pure Random
+                  </option>
+                  <option value="boundary-aware">
+                    Boundary Aware
+                  </option>
+                </select>
+              </label>
+
+              <label class="select-control">
+                <span>流式画像 preset</span>
+                <select v-model="selectedStreamPresetId">
+                  <option v-for="preset in STREAM_PRESETS" :key="preset.id" :value="preset.id">
+                    {{ preset.label }}
+                  </option>
+                  <option :value="CUSTOM_STREAM_PRESET_ID">
+                    Custom
+                  </option>
+                </select>
+              </label>
+
+              <p class="control-note">
+                {{ streamPresetDescription }}
+              </p>
+
               <label class="range-control">
-                <span>每次追加字符数</span>
-                <strong>{{ streamSpeed }}</strong>
-                <input v-model.number="streamSpeed" type="range" min="1" max="80">
+                <span>chunkSizeMin</span>
+                <strong>{{ normalizedChunkSizeRange.min }}</strong>
+                <input v-model.number="streamChunkSizeMin" type="range" min="1" max="80" step="1">
               </label>
 
               <label class="range-control">
-                <span>更新时间间隔</span>
-                <strong>{{ streamInterval }}ms</strong>
-                <input v-model.number="streamInterval" type="range" min="8" max="300" step="4">
+                <span>chunkSizeMax</span>
+                <strong>{{ normalizedChunkSizeRange.max }}</strong>
+                <input v-model.number="streamChunkSizeMax" type="range" min="1" max="80" step="1">
               </label>
+
+              <label class="range-control">
+                <span>chunkDelayMin</span>
+                <strong>{{ normalizedChunkDelayRange.min }}ms</strong>
+                <input v-model.number="streamChunkDelayMin" type="range" min="8" max="600" step="4">
+              </label>
+
+              <label class="range-control">
+                <span>chunkDelayMax</span>
+                <strong>{{ normalizedChunkDelayRange.max }}ms</strong>
+                <input v-model.number="streamChunkDelayMax" type="range" min="8" max="600" step="4">
+              </label>
+
+              <label class="range-control">
+                <span>突发/停顿强度</span>
+                <strong>{{ streamBurstiness }}%</strong>
+                <input v-model.number="streamBurstiness" type="range" min="0" max="100" step="1">
+              </label>
+
+              <p class="control-note">
+                当前窗口：{{ streamChunkRangeLabel }}，{{ streamDelayRangeLabel }}。当 min=max 时就是固定节奏。
+              </p>
+
+              <p class="control-note">
+                `Pure Random` 会直接按随机长度做原始 `slice`；`Boundary Aware` 会尽量贴近单词或标点边界。
+              </p>
+
+              <p class="control-note">
+                `ReadableStream` 更接近真实 reader 消费链路；`Scheduler` 保留我们本地定时调度模型。burstiness 只会影响非纯随机调度。
+              </p>
 
               <div class="toggle-grid">
                 <label class="toggle-item">
@@ -573,6 +742,10 @@ watch(mermaidEnabled, (enabled) => {
                 <label class="toggle-item">
                   <span>解析树 debug</span>
                   <input v-model="debugParse" type="checkbox">
+                </label>
+                <label class="toggle-item">
+                  <span>chunk debug</span>
+                  <input v-model="streamDebug" type="checkbox">
                 </label>
               </div>
 
@@ -733,11 +906,11 @@ watch(mermaidEnabled, (enabled) => {
         </aside>
 
         <section class="workspace-grid">
-          <article class="workspace-card">
+          <article class="workspace-card workspace-card--pane">
             <header class="workspace-card__head">
               <div>
                 <h2>Markdown 输入</h2>
-                <p>左侧编辑，右侧马上验证渲染结果。</p>
+                <p>把 markdown 粘进来，右侧立即看到真实渲染结果。</p>
               </div>
               <span class="mini-pill">Live editor</span>
             </header>
@@ -755,24 +928,57 @@ watch(mermaidEnabled, (enabled) => {
             </footer>
           </article>
 
-          <article class="workspace-card">
+          <article ref="previewCardRef" class="workspace-card workspace-card--pane workspace-card--preview">
             <header class="workspace-card__head">
               <div>
                 <h2>实时预览</h2>
-                <p>当前模式：{{ renderModeLabel }}</p>
+                <p>
+                  当前模式：{{ renderModeLabel }}{{ isPreviewFullscreen ? ' · 按 Esc 退出全屏' : '' }}
+                </p>
               </div>
-              <span class="mini-pill" :class="{ 'mini-pill--active': isStreaming }">
-                {{ isStreaming ? 'Streaming' : 'Ready' }}
-              </span>
+              <div class="workspace-card__head-actions">
+                <button
+                  type="button"
+                  class="ghost-button icon-button"
+                  data-testid="theme-toggle-button"
+                  :aria-label="isDark ? '切换到浅色模式' : '切换到暗色模式'"
+                  :title="isDark ? '切换到浅色模式' : '切换到暗色模式'"
+                  @click="toggleAppearance"
+                >
+                  <Icon
+                    :icon="isDark ? 'carbon:moon' : 'carbon:sun'"
+                    class="icon-button__icon"
+                  />
+                </button>
+                <button
+                  type="button"
+                  class="ghost-button"
+                  data-testid="preview-fullscreen-button"
+                  :aria-pressed="isPreviewFullscreen"
+                  @click="togglePreviewFullscreen"
+                >
+                  {{ isPreviewFullscreen ? '退出全屏' : '全屏预览' }}
+                </button>
+                <span class="mini-pill" :class="{ 'mini-pill--active': isStreaming }">
+                  {{ isStreaming ? 'Streaming' : 'Ready' }}
+                </span>
+              </div>
             </header>
 
             <div class="preview-surface">
               <MarkdownRender
                 :content="previewContent"
+                :custom-html-tags="testPageCustomHtmlTags"
+                :is-dark="isDark"
+                :mermaid-props="{ maxHeight: previewDiagramMaxHeight }"
+                :d2-props="{ maxHeight: previewD2MaxHeight }"
+                :infographic-props="{ maxHeight: previewDiagramMaxHeight }"
                 :viewport-priority="viewportPriority"
                 :batch-rendering="batchRendering"
                 :typewriter="typewriter"
                 :code-block-stream="codeBlockStream"
+                code-block-dark-theme="vitesse-dark"
+                code-block-light-theme="vitesse-light"
                 :code-block-monaco-options="testPageMonacoOptions"
                 :parse-options="{ debug: debugParse }"
               />
@@ -780,8 +986,26 @@ watch(mermaidEnabled, (enabled) => {
 
             <footer class="workspace-card__foot">
               <span>{{ previewContent.length }} chars rendered</span>
-              <span>{{ isStreaming ? '正在逐步追加中' : '已显示完整输入' }}</span>
+              <span>{{ isStreaming ? (isPaused ? '流式已暂停' : '正在逐步追加中') : '已显示完整输入' }}</span>
             </footer>
+          </article>
+
+          <article v-if="streamDebug && streamChunks.length" class="workspace-card workspace-card--full">
+            <header class="workspace-card__head">
+              <div>
+                <h2>Chunk Debug</h2>
+                <p>逐块查看 delay、slice 内容和累计节奏。</p>
+              </div>
+              <span class="mini-pill">{{ streamChunks.length }} chunks</span>
+            </header>
+
+            <div class="chunk-log">
+              <div v-for="chunk in streamChunks" :key="chunk.index" class="chunk-log__row">
+                <strong>#{{ chunk.index }}</strong>
+                <span>{{ chunk.delay }}ms</span>
+                <code>{{ JSON.stringify(chunk.content) }}</code>
+              </div>
+            </div>
           </article>
 
           <article class="workspace-card workspace-card--full">
@@ -827,6 +1051,7 @@ watch(mermaidEnabled, (enabled) => {
   --lab-muted: #59708f;
   --lab-accent: #1d4ed8;
   --lab-accent-soft: rgba(29, 78, 216, 0.12);
+  --workspace-pane-height: clamp(540px, 72vh, 880px);
   position: relative;
   min-height: 100vh;
   padding: 28px 18px 42px;
@@ -836,6 +1061,23 @@ watch(mermaidEnabled, (enabled) => {
     linear-gradient(180deg, #f8fbff 0%, var(--lab-bg) 100%);
   color: var(--lab-text);
   overflow: hidden;
+}
+
+.test-lab--dark {
+  --lab-bg: #08111f;
+  --lab-surface: rgba(9, 18, 32, 0.82);
+  --lab-surface-strong: rgba(15, 23, 42, 0.94);
+  --lab-border: rgba(148, 163, 184, 0.14);
+  --lab-shadow: 0 28px 80px rgba(2, 6, 23, 0.45);
+  --lab-text: #e2e8f0;
+  --lab-muted: #94a3b8;
+  --lab-accent: #60a5fa;
+  --lab-accent-soft: rgba(96, 165, 250, 0.16);
+  color-scheme: dark;
+  background:
+    radial-gradient(circle at top left, rgba(14, 165, 233, 0.16), transparent 30%),
+    radial-gradient(circle at 85% 12%, rgba(245, 158, 11, 0.12), transparent 28%),
+    linear-gradient(180deg, #0b1220 0%, var(--lab-bg) 100%);
 }
 
 .test-lab__shell {
@@ -913,6 +1155,12 @@ watch(mermaidEnabled, (enabled) => {
   text-transform: uppercase;
 }
 
+.test-lab--dark .eyebrow {
+  background: rgba(15, 23, 42, 0.84);
+  border-color: rgba(96, 165, 250, 0.22);
+  color: #93c5fd;
+}
+
 .hero-panel h1 {
   margin: 12px 0 10px;
   font-size: clamp(2.1rem, 4vw, 3.4rem);
@@ -984,6 +1232,28 @@ watch(mermaidEnabled, (enabled) => {
   background: linear-gradient(135deg, rgba(29, 78, 216, 0.12), rgba(34, 197, 94, 0.08));
 }
 
+.test-lab--dark .metric-card,
+.test-lab--dark .framework-chip,
+.test-lab--dark .sample-card,
+.test-lab--dark .range-control,
+.test-lab--dark .select-control,
+.test-lab--dark .toggle-item,
+.test-lab--dark .text-control,
+.test-lab--dark .segmented-control__button,
+.test-lab--dark .preset-chip {
+  background: rgba(15, 23, 42, 0.78);
+  border-color: rgba(148, 163, 184, 0.12);
+}
+
+.test-lab--dark .framework-chip--current,
+.test-lab--dark .sample-card--active,
+.test-lab--dark .segmented-control__button--active,
+.test-lab--dark .preset-chip--active {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.22), rgba(15, 23, 42, 0.92));
+  border-color: rgba(96, 165, 250, 0.3);
+  color: #bfdbfe;
+}
+
 .framework-chip__label {
   font-weight: 700;
   font-size: 1rem;
@@ -1020,6 +1290,10 @@ watch(mermaidEnabled, (enabled) => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.workspace-card__head {
+  flex-wrap: wrap;
 }
 
 .panel-card__head h2,
@@ -1148,6 +1422,12 @@ watch(mermaidEnabled, (enabled) => {
   color: var(--lab-muted);
 }
 
+.test-lab--dark .action-button:not(.action-button--primary),
+.test-lab--dark .ghost-button {
+  background: rgba(30, 41, 59, 0.84);
+  color: #cbd5e1;
+}
+
 .progress-block {
   margin-top: 16px;
 }
@@ -1158,6 +1438,10 @@ watch(mermaidEnabled, (enabled) => {
   overflow: hidden;
   border-radius: 999px;
   background: rgba(15, 23, 42, 0.08);
+}
+
+.test-lab--dark .progress-track {
+  background: rgba(51, 65, 85, 0.7);
 }
 
 .progress-fill {
@@ -1196,6 +1480,14 @@ watch(mermaidEnabled, (enabled) => {
   width: 100%;
 }
 
+.control-note {
+  margin: 0;
+  padding: 0 4px;
+  color: var(--lab-muted);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
 .select-control select {
   border: 0;
   border-radius: 14px;
@@ -1230,6 +1522,12 @@ watch(mermaidEnabled, (enabled) => {
 
 .text-control input:focus {
   outline: none;
+}
+
+.test-lab--dark .select-control select,
+.test-lab--dark .text-control input {
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
 }
 
 .segmented-control {
@@ -1330,6 +1628,38 @@ watch(mermaidEnabled, (enabled) => {
   color: #b45309;
 }
 
+.test-lab--dark .mini-pill {
+  background: rgba(30, 41, 59, 0.9);
+  color: #cbd5e1;
+}
+
+.test-lab--dark .mini-pill--active {
+  background: rgba(37, 99, 235, 0.2);
+  color: #bfdbfe;
+}
+
+.workspace-card__head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+}
+
+.icon-button__icon {
+  width: 18px;
+  height: 18px;
+}
+
 .workspace-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1343,6 +1673,13 @@ watch(mermaidEnabled, (enabled) => {
 .workspace-card--full {
   grid-column: 1 / -1;
   min-height: 720px;
+}
+
+.workspace-card--pane {
+  height: var(--workspace-pane-height);
+  min-height: var(--workspace-pane-height);
+  max-height: var(--workspace-pane-height);
+  overflow: hidden;
 }
 
 .workspace-card__head,
@@ -1381,10 +1718,66 @@ watch(mermaidEnabled, (enabled) => {
     linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 249, 253, 0.92));
 }
 
+.workspace-card--pane .editor-textarea,
+.workspace-card--pane .preview-surface {
+  min-height: 0;
+  height: 100%;
+}
+
+.test-lab--dark .editor-textarea {
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.96), rgba(15, 23, 42, 0.94));
+  color: #e2e8f0;
+}
+
+.test-lab--dark .preview-surface {
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.98), rgba(15, 23, 42, 0.96));
+}
+
+.workspace-card--preview:fullscreen {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  min-height: 100vh;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: auto;
+  background: #fff;
+}
+
+.workspace-card--preview:fullscreen::backdrop {
+  background: rgba(15, 23, 42, 0.78);
+}
+
+.workspace-card--preview:fullscreen .workspace-card__head,
+.workspace-card--preview:fullscreen .workspace-card__foot {
+  display: none;
+}
+
+.workspace-card--preview:fullscreen .preview-surface {
+  min-height: 100vh;
+  height: auto;
+  padding: 40px min(6vw, 72px);
+  overflow: visible;
+  box-sizing: border-box;
+  background: #fff;
+}
+
+.test-lab--dark .workspace-card--preview:fullscreen {
+  background: #020617;
+}
+
+.test-lab--dark .workspace-card--preview:fullscreen .preview-surface {
+  background: #020617;
+}
+
 .sandbox-frame-shell {
   min-height: 620px;
   background:
     linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(239, 246, 255, 0.9));
+}
+
+.test-lab--dark .sandbox-frame-shell {
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.96), rgba(15, 23, 42, 0.92));
 }
 
 .sandbox-frame {
@@ -1411,6 +1804,7 @@ watch(mermaidEnabled, (enabled) => {
 
 @media (max-width: 820px) {
   .test-lab {
+    --workspace-pane-height: clamp(420px, 68vh, 680px);
     padding: 18px 12px 28px;
   }
 
@@ -1443,6 +1837,11 @@ watch(mermaidEnabled, (enabled) => {
   .editor-textarea,
   .preview-surface {
     min-height: 420px;
+  }
+
+  .workspace-card__head-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .meta-list__row {

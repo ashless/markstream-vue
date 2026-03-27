@@ -11,8 +11,23 @@
 Refer to `src/types/component-props.ts` for full signature. Key props:
 - `node` — code_block node (required)
 - `loading`, `stream`, `isShowPreview`
-- `monacoOptions` — forwarded to `stream-monaco`; this is where diff hover-action options such as `diffHunkActionsOnHover`, `diffHunkHoverHideDelayMs`, and `onDiffHunkAction` belong
+- `monacoOptions` — typed as `CodeBlockMonacoOptions` and forwarded to `stream-monaco`
+  - diff options such as `diffHideUnchangedRegions`, `diffLineStyle`, `diffAppearance`, `diffUnchangedRegionStyle`, `diffHunkActionsOnHover`, `diffHunkHoverHideDelayMs`, and `onDiffHunkAction` belong here
 - Header controls: `showHeader`, `showCollapseButton`, `showCopyButton`, `showExpandButton`, `showPreviewButton`, `showFontSizeButtons`, `showTooltips`
+
+Default diff UX in Monaco mode:
+
+- `diffHideUnchangedRegions: { enabled: true, contextLineCount: 2, minimumLineCount: 4, revealLineCount: 5 }`
+- `diffLineStyle: 'background'`
+- `diffAppearance: 'auto'`
+- `diffUnchangedRegionStyle: 'line-info'`
+- `diffHunkActionsOnHover: true`
+- `diffHunkHoverHideDelayMs: 160`
+
+You can override any of them through `monacoOptions`.
+When the preset uses `diffAppearance: 'auto'`, `CodeBlockNode` resolves it to the current light/dark surface before passing the options to `stream-monaco`.
+
+Diff blocks also show `- / +` line counts in the built-in header.
 
 ## Slots
 - `header-left` — replace left header
@@ -32,31 +47,81 @@ pnpm add stream-monaco
 
 ### Basic example
 
-```vue
-<CodeBlockNode :node="{ type: 'code_block', language: 'js', code: 'console.log(1)', raw: 'console.log(1)' }" />
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'js',
+  code: 'console.log(1)',
+  raw: 'console.log(1)',
+} satisfies CodeBlockNodeProps['node']
+</script>
+
+<template>
+  <CodeBlockNode :node="node" />
+</template>
 ```
 
 ### Replace header and hide copy button
 
-```vue
-<CodeBlockNode :node="node" :showCopyButton="false">
-  <template #header-left>
-    <div class="flex items-center">Custom left</div>
-  </template>
-  <template #header-right>
-    <button @click="runSnippet">Run</button>
-  </template>
-</CodeBlockNode>
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'js',
+  code: 'console.log(1)',
+  raw: 'console.log(1)',
+} satisfies CodeBlockNodeProps['node']
+
+function runSnippet() {}
+</script>
+
+<template>
+  <CodeBlockNode :node="node" :show-copy-button="false">
+    <template #header-left>
+      <div class="flex items-center">
+        Custom left
+      </div>
+    </template>
+    <template #header-right>
+      <button @click="runSnippet">
+        Run
+      </button>
+    </template>
+  </CodeBlockNode>
+</template>
 ```
 
 ### Custom loading placeholder
 
-```vue
-<CodeBlockNode :node="node" :stream="false" :loading="true">
-  <template #loading="{ loading, stream }">
-    <div v-if="loading && !stream">Loading editor assets…</div>
-  </template>
-</CodeBlockNode>
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'ts',
+  code: 'console.log("loading")',
+  raw: 'console.log("loading")',
+} satisfies CodeBlockNodeProps['node']
+</script>
+
+<template>
+  <CodeBlockNode :node="node" :stream="false" :loading="true">
+    <template #loading="{ loading, stream }">
+      <div v-if="loading && !stream">
+        Loading editor assets…
+      </div>
+    </template>
+  </CodeBlockNode>
+</template>
 ```
 
 ## Theme Switching
@@ -66,7 +131,7 @@ pnpm add stream-monaco
 ### Using @vueuse/core in standalone Vue apps
 
 ```vue
-<script setup>
+<script setup lang="ts">
 import { useDark, useToggle } from '@vueuse/core'
 import MarkdownRender from 'markstream-vue'
 
@@ -120,7 +185,7 @@ export function useDark() {
 
 ```vue
 <!-- In any .md file or component -->
-<script setup>
+<script setup lang="ts">
 import MarkdownRender from 'markstream-vue'
 import { useDark } from '../../.vitepress/theme'
 
@@ -171,7 +236,10 @@ Try this — simple snapshot example (inline usage):
 
 ```vue
 <script setup lang="ts">
-const node = { type: 'code_block', language: 'js', code: 'console.log("hello")', raw: 'console.log("hello")' }
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = { type: 'code_block', language: 'js', code: 'console.log("hello")', raw: 'console.log("hello")' } satisfies CodeBlockNodeProps['node']
 </script>
 
 <template>

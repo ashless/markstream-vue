@@ -38,7 +38,7 @@ const showSourceFallback = computed(() => {
 })
 const hasPreview = computed(() => !!svgMarkup.value)
 const bodyStyle = computed(() => {
-  if (!bodyMinHeight.value)
+  if (!showSourceFallback.value || !bodyMinHeight.value)
     return undefined
   return { minHeight: `${bodyMinHeight.value}px` }
 })
@@ -199,6 +199,7 @@ function toSafeSvgMarkup(svg: string | null | undefined) {
     return ''
   const svgElement = svgEl as unknown as SVGElement
   scrubSvgElement(svgElement)
+  svgElement.classList.add('markstream-d2-root-svg')
   return svgElement.outerHTML
 }
 
@@ -456,6 +457,8 @@ onBeforeUnmount(() => {
 <template>
   <div
     class="d2-block-container my-4 rounded-lg border overflow-hidden shadow-sm"
+    data-markstream-d2="1"
+    :data-markstream-mode="showSourceFallback ? 'fallback' : 'preview'"
     :class="props.isDark ? 'border-gray-700/30 bg-gray-900 text-gray-100' : 'border-gray-200 bg-white text-gray-900'"
   >
     <div
@@ -587,7 +590,8 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
-.d2-svg :deep(svg) {
+.d2-svg :deep(svg.markstream-d2-root-svg) {
+  width: 100%;
   max-width: 100%;
   height: auto;
   display: block;

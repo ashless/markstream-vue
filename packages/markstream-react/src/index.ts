@@ -1,3 +1,5 @@
+import type { CustomComponentMap as MarkstreamCustomComponentMap } from './customComponents'
+import type { RenderContext as MarkstreamRenderContext, RenderNodeFn as MarkstreamRenderNodeFn } from './types'
 import './index.css'
 import './workers/katexRenderer.worker?worker'
 import './workers/mermaidParser.worker?worker'
@@ -8,6 +10,7 @@ export { CheckboxNode } from './components/CheckboxNode/CheckboxNode'
 export { CodeBlockNode } from './components/CodeBlockNode/CodeBlockNode'
 export { CodeBlockNode as ReactCodeBlockNode } from './components/CodeBlockNode/CodeBlockNode'
 export { HtmlPreviewFrame } from './components/CodeBlockNode/HtmlPreviewFrame'
+export type { HtmlPreviewFrameProps } from './components/CodeBlockNode/HtmlPreviewFrame'
 export type { D2Loader } from './components/D2BlockNode/d2'
 export { disableD2, enableD2, isD2Enabled, setD2Loader } from './components/D2BlockNode/d2'
 export { D2BlockNode } from './components/D2BlockNode/D2BlockNode'
@@ -27,9 +30,12 @@ export { InfographicBlockNode } from './components/InfographicBlockNode/Infograp
 export { InlineCodeNode } from './components/InlineCodeNode/InlineCodeNode'
 export { InsertNode } from './components/InsertNode/InsertNode'
 export { LinkNode } from './components/LinkNode/LinkNode'
+export type { LinkNodeStyleProps } from './components/LinkNode/LinkNode'
 export { ListItemNode } from './components/ListItemNode/ListItemNode'
+export type { ListItemNodeProps } from './components/ListItemNode/ListItemNode'
 export { ListNode } from './components/ListNode/ListNode'
 export { MarkdownCodeBlockNode } from './components/MarkdownCodeBlockNode/MarkdownCodeBlockNode'
+export type { MarkdownCodeBlockNodeProps } from './components/MarkdownCodeBlockNode/MarkdownCodeBlockNode'
 export { MathBlockNode } from './components/MathBlockNode/MathBlockNode'
 export { MathInlineNode } from './components/MathInlineNode/MathInlineNode'
 export { MermaidBlockNode } from './components/MermaidBlockNode/MermaidBlockNode'
@@ -47,6 +53,7 @@ export { TableNode } from './components/TableNode/TableNode'
 export { TextNode } from './components/TextNode/TextNode'
 export { ThematicBreakNode } from './components/ThematicBreakNode/ThematicBreakNode'
 export { Tooltip } from './components/Tooltip/Tooltip'
+export type { TooltipPlacement, TooltipProps } from './components/Tooltip/Tooltip'
 export { VmrContainerNode } from './components/VmrContainerNode/VmrContainerNode'
 export {
   clearGlobalCustomComponents,
@@ -57,8 +64,35 @@ export {
 export * from './i18n/useSafeI18n'
 export * from './renderers/renderNode'
 export type { NodeRendererProps } from './types'
-export * from './types/component-props'
+export type {
+  CodeBlockDiffAppearance,
+  CodeBlockDiffHideUnchangedRegions,
+  CodeBlockDiffHideUnchangedRegionsOptions,
+  CodeBlockDiffHunkActionContext,
+  CodeBlockDiffHunkActionKind,
+  CodeBlockDiffHunkSide,
+  CodeBlockDiffLineStyle,
+  CodeBlockDiffUnchangedRegionStyle,
+  CodeBlockMonacoLanguage,
+  CodeBlockMonacoOptions,
+  CodeBlockMonacoTheme,
+  CodeBlockMonacoThemeObject,
+  CodeBlockNodeProps,
+  D2BlockNodeProps,
+  ImageNodeProps,
+  InfographicBlockNodeProps,
+  LinkNodeProps,
+  MathBlockNodeProps,
+  MathInlineNodeProps,
+  MermaidBlockEvent,
+  MermaidBlockNodeProps,
+  PreCodeNodeProps,
+} from './types/component-props'
 export type { NodeComponentProps } from './types/node-component'
 export * from './utils/languageIcon'
 export * from './workers/katexWorkerClient'
 export * from './workers/mermaidWorkerClient'
+
+export type CustomComponentMap = MarkstreamCustomComponentMap
+export type RenderContext = MarkstreamRenderContext
+export type RenderNodeFn = MarkstreamRenderNodeFn

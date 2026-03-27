@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { MarkdownRender } from 'markstream-vue'
 
-defineProps<{ node: {
-  type: 'thinking'
-  content: string
-  children: any[]
-  loading?: boolean
-} }>()
+defineProps<{
+  node: {
+    type: 'thinking'
+    content: string
+    children: any[]
+    loading?: boolean
+  }
+  isDark?: boolean
+}>()
 </script>
 
 <template>
@@ -37,7 +40,7 @@ defineProps<{ node: {
         <span v-if="node.loading" class="sr-only" aria-live="polite">Thinking…</span>
         <transition name="fade" mode="out-in">
           <div key="{{ node.loading ? 'loading' : 'ready' }}" class="content-area">
-            <MarkdownRender :content="node.content" />
+            <MarkdownRender :content="node.content" :is-dark="isDark" />
           </div>
         </transition>
       </div>

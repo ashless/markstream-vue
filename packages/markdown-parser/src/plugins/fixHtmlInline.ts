@@ -96,6 +96,139 @@ const CLOSE_TAG_RE = /<\/\s*([A-Z][\w-]*)(?=[\s/>]|$)/gi
 const TAG_NAME_AT_START_RE = /^<\s*(?:\/\s*)?([A-Z][\w-]*)/i
 const STRICT_OPEN_TAG_NAME_AT_START_RE = /^<\s*([A-Z][\w:-]*)(?=[\s/>]|$)/i
 
+function getHtmlInlineTagName(content: string) {
+  return (content.match(TAG_NAME_AT_START_RE)?.[1] ?? '').toLowerCase()
+}
+
+function isHtmlInlineClosingTag(content: string) {
+  return /^\s*<\s*\//.test(content)
+}
+
+function isSelfClosingHtmlInline(content: string, tag: string) {
+  return VOID_TAGS.has(tag) || /\/\s*>\s*$/.test(content)
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function findMatchingCloseChildIndex(
+  children: Array<{ type?: string, content?: string }>,
+  tag: string,
+) {
+  let depth = 0
+
+  for (let index = 0; index < children.length; index++) {
+    const child = children[index]
+    if (!child || child.type !== 'html_inline')
+      continue
+
+    const content = String(child.content ?? '')
+    const childTag = getHtmlInlineTagName(content)
+    if (childTag !== tag)
+      continue
+
+    if (isHtmlInlineClosingTag(content)) {
+      if (depth === 0)
+        return index
+      depth--
+      continue
+    }
+
+    if (!isSelfClosingHtmlInline(content, childTag))
+      depth++
+  }
+
+  return -1
+}
+
+function getTrailingOpenDepth(
+  children: Array<{ type?: string, content?: string }>,
+  tag: string,
+) {
+  let depth = 0
+
+  for (const child of children) {
+    if (!child || child.type !== 'html_inline')
+      continue
+
+    const content = String(child.content ?? '')
+    const childTag = getHtmlInlineTagName(content)
+    if (childTag !== tag)
+      continue
+
+    if (isHtmlInlineClosingTag(content)) {
+      if (depth > 0)
+        depth--
+      continue
+    }
+
+    if (!isSelfClosingHtmlInline(content, childTag))
+      depth++
+  }
+
+  return depth
+}
+
+function findMatchingCloseRangeInHtml(content: string, tag: string, startIndex = 0) {
+  const tokenRe = new RegExp(String.raw`<\s*(\/?)\s*${escapeRegex(tag)}(?=[\s>/])[^>]*>`, 'gi')
+  tokenRe.lastIndex = Math.max(0, startIndex)
+  let depth = 0
+  let match: RegExpExecArray | null
+
+  while ((match = tokenRe.exec(content)) !== null) {
+    const raw = match[0] ?? ''
+    const closing = !!match[1]
+    const selfClosing = !closing && /\/\s*>$/.test(raw)
+
+    if (closing) {
+      if (depth === 0) {
+        return {
+          start: match.index,
+          end: match.index + raw.length,
+        }
+      }
+      depth--
+      continue
+    }
+
+    if (!selfClosing)
+      depth++
+  }
+
+  return null
+}
+
+function findMatchingCloseOffsetInHtml(content: string, tag: string, startIndex = 0) {
+  const range = findMatchingCloseRangeInHtml(content, tag, startIndex)
+  if (!range)
+    return -1
+  return range.end
+}
+
+function getTrailingCustomTagDepthInHtml(content: string, tag: string) {
+  const tokenRe = new RegExp(String.raw`<\s*(\/?)\s*${escapeRegex(tag)}(?=[\s>/])[^>]*>`, 'gi')
+  let depth = 0
+  let match: RegExpExecArray | null
+
+  while ((match = tokenRe.exec(content)) !== null) {
+    const raw = match[0] ?? ''
+    const closing = !!match[1]
+    const selfClosing = !closing && /\/\s*>$/.test(raw)
+
+    if (closing) {
+      if (depth > 0)
+        depth--
+      continue
+    }
+
+    if (!selfClosing)
+      depth++
+  }
+
+  return depth
+}
+
 function findTagCloseIndexOutsideQuotes(html: string) {
   let inSingle = false
   let inDouble = false
@@ -391,6 +524,7 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
       autoCloseInlineTagSet.add(name)
     }
   }
+  const shouldMergeHtmlBlockTag = (tag: string) => customTagSet.has(tag) || !commonHtmlTags.has(tag)
   // Streaming mid-state: suppress partial inline HTML in text tokens until the
   // tag is fully closed with `>`, then allow it to be tokenized as html_inline.
   md.core.ruler.after('inline', 'fix_html_inline_streaming', (state: unknown) => {
@@ -459,16 +593,16 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
           }
 
           const chunk = String((t as any).content ?? (t as any).raw ?? '')
-          const closeRe = new RegExp(`<\\s*\\/\\s*${openTag}\\s*>`, 'i')
-          const closeMatch = chunk ? closeRe.exec(chunk) : null
-          const isClosingTag = !!closeMatch
+          const closeEnd = chunk
+            ? findMatchingCloseOffsetInHtml(chunk, openTag)
+            : -1
+          const isClosingTag = closeEnd !== -1
 
           if (chunk) {
             const openToken = toks[openIndex] as Token & { content?: string, loading?: boolean }
-            if (closeMatch && typeof closeMatch.index === 'number') {
-              const end = closeMatch.index + String(closeMatch[0] ?? '').length
-              const before = chunk.slice(0, end)
-              const after = chunk.slice(end)
+            if (closeEnd !== -1) {
+              const before = chunk.slice(0, closeEnd)
+              const after = chunk.slice(closeEnd)
 
               openToken.content = `${String(openToken.content || '')}\n${before}`
               openToken.loading = false
@@ -508,10 +642,10 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
         const tag = (rawContent.match(/<\s*(?:\/\s*)?([^\s>/]+)/)?.[1] ?? '').toLowerCase()
         const isClosingTag = /^\s*<\s*\//.test(rawContent)
 
-        // Only apply the "merge everything into an unclosed html_block" behavior
-        // for configured custom tags. Applying it to normal HTML (e.g. <br/>) can
-        // incorrectly swallow following Markdown blocks into the html_block.
-        if (!tag || !customTagSet.has(tag))
+        // Merge configured custom tags and unknown HTML-like tags (e.g. <think>)
+        // until their matching closing tag arrives. Keep standard HTML tags like
+        // <div> and <br> on the markdown-it default path.
+        if (!tag || !shouldMergeHtmlBlockTag(tag))
           continue
 
         if (!isClosingTag) {
@@ -520,9 +654,8 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
             // If the html_block already contains its own closing tag, do NOT
             // push it onto the stack; otherwise we'd incorrectly merge the
             // following blocks into this html_block.
-            const closeRe = new RegExp(`<\\s*\\/\\s*${tag}\\s*>`, 'i')
             const selfClosingRe = new RegExp(`^\\s*<\\s*${tag}\\b[^>]*\\/\\s*>`, 'i')
-            if (!selfClosingRe.test(rawContent) && !closeRe.test(rawContent))
+            if (!selfClosingRe.test(rawContent) && getTrailingCustomTagDepthInHtml(rawContent, tag) > 0)
               tagStack.push([tag, i])
           }
         }
@@ -630,12 +763,7 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
             continue
 
           const children = Array.isArray(tok.children) ? tok.children : []
-          const closeChildIndex = children.findIndex((c: any) => {
-            if (!c || c.type !== 'html_inline')
-              return false
-            const cContent = String(c.content ?? '')
-            return /^\s*<\s*\//.test(cContent) && cContent.toLowerCase().includes(top.tag)
-          })
+          const closeChildIndex = findMatchingCloseChildIndex(children, top.tag)
 
           // If the closing tag is inside this inline token, merge up to it and
           // keep the trailing content as a new paragraph so it doesn't get
@@ -692,8 +820,12 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
         // Not inside: detect an opening custom tag that does not close within this token.
         if (tok.type !== 'inline')
           continue
+        const children = Array.isArray(tok.children) ? tok.children : []
         for (const tag of customTagSet) {
-          if (getOpenRe(tag).test(content) && !getCloseRe(tag).test(content)) {
+          const trailingOpenDepth = children.length
+            ? getTrailingOpenDepth(children, tag)
+            : (getOpenRe(tag).test(content) && !getCloseRe(tag).test(content) ? 1 : 0)
+          if (trailingOpenDepth > 0) {
             stack.push({ tag, index: i })
             break
           }
@@ -742,19 +874,20 @@ export function applyFixHtmlInlineTokens(md: MarkdownIt, options: FixHtmlInlineO
         // These are handled specially to support streaming and structured nodes
         if (customTagSet.has(tag)) {
           const raw = String(t.content ?? '')
-          const closeRe = new RegExp(`<\\/\\s*${tag}\\s*>`, 'i')
-          const hasClose = closeRe.test(raw)
+          const openEnd = findTagCloseIndexOutsideQuotes(raw)
+          const closeRange = openEnd === -1
+            ? null
+            : findMatchingCloseRangeInHtml(raw, tag, openEnd + 1)
+          const hasClose = !!closeRange
           t.loading = hasClose ? false : t.loading !== undefined ? t.loading : true
 
-          const closeMatch = closeRe.exec(raw)
-          const endTagIndex = closeMatch ? closeMatch.index : -1
-          const closeLen = closeMatch ? closeMatch[0].length : 0
+          const endTagIndex = closeRange?.start ?? -1
+          const closeLen = closeRange ? closeRange.end - closeRange.start : 0
 
           if (endTagIndex !== -1) {
             // Found a closing tag - extract inner content and trim
             const rawForNode = raw.slice(0, endTagIndex + closeLen)
             let inner = ''
-            const openEnd = findTagCloseIndexOutsideQuotes(raw)
             if (openEnd !== -1 && openEnd < endTagIndex) {
               inner = raw.slice(openEnd + 1, endTagIndex)
             }

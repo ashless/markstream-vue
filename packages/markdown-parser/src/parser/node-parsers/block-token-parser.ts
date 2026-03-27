@@ -107,12 +107,7 @@ function parseVmrContainer(
         const childrenArr = (contentToken.children as MarkdownToken[]) || []
         children.push({
           type: 'paragraph',
-          children: parseInlineTokens(childrenArr || [], undefined, undefined, {
-            requireClosingStrong: options?.requireClosingStrong,
-            final: options?.final,
-            customHtmlTags: options?.customHtmlTags,
-            validateLink: options?.validateLink,
-          }),
+          children: parseInlineTokens(childrenArr || [], undefined, undefined, options as any),
           raw: String(contentToken.content ?? ''),
         })
       }
@@ -209,6 +204,63 @@ function stripTrailingPartialClosingTag(inner: string, tag: string) {
     return inner
   const re = new RegExp(String.raw`[\t ]*<\s*\/\s*${tag}[^>]*$`, 'i')
   return inner.replace(re, '')
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function findMatchingCloseTagRange(
+  rawHtml: string,
+  tag: string,
+  startIndex: number,
+) {
+  if (!rawHtml || !tag)
+    return null
+
+  const lowerTag = tag.toLowerCase()
+  const openTagRe = new RegExp(String.raw`^<\s*${escapeRegex(lowerTag)}(?=\s|>|/)`, 'i')
+  const closeTagRe = new RegExp(String.raw`^<\s*\/\s*${escapeRegex(lowerTag)}(?=\s|>)`, 'i')
+
+  let depth = 0
+  let index = Math.max(0, startIndex)
+
+  while (index < rawHtml.length) {
+    const lt = rawHtml.indexOf('<', index)
+    if (lt === -1)
+      break
+
+    const slice = rawHtml.slice(lt)
+    if (closeTagRe.test(slice)) {
+      const endRel = findTagCloseIndexOutsideQuotes(slice)
+      if (endRel === -1)
+        return null
+      if (depth === 0) {
+        return {
+          start: lt,
+          end: lt + endRel + 1,
+        }
+      }
+      depth--
+      index = lt + endRel + 1
+      continue
+    }
+
+    if (openTagRe.test(slice)) {
+      const endRel = findTagCloseIndexOutsideQuotes(slice)
+      if (endRel === -1)
+        return null
+      const raw = slice.slice(0, endRel + 1)
+      if (!/\/\s*>$/.test(raw))
+        depth++
+      index = lt + endRel + 1
+      continue
+    }
+
+    index = lt + 1
+  }
+
+  return null
 }
 
 function findNextCustomHtmlBlockFromSource(
@@ -364,12 +416,15 @@ export function parseBasicBlockToken(
         if (fromSource)
           (options as any).__customHtmlBlockCursor = fromSource.end
 
-        const rawHtml = String(fromSource?.raw ?? htmlBlockNode.content ?? '')
+        const rawHtml = String(fromSource?.raw ?? htmlBlockNode.raw ?? '')
 
         const openEnd = findTagCloseIndexOutsideQuotes(rawHtml)
-        const closeRe = new RegExp(`<\\s*\\/\\s*${tag}\\s*>`, 'i')
-        const closeMatch = closeRe.exec(rawHtml)
-        const closeIndex = closeMatch ? closeMatch.index : -1
+        const openTag = openEnd !== -1 ? rawHtml.slice(0, openEnd + 1) : rawHtml
+        const selfClosing = openEnd !== -1 && /\/\s*>\s*$/.test(openTag)
+        const closeRange = openEnd === -1
+          ? null
+          : findMatchingCloseTagRange(rawHtml, tag, openEnd + 1)
+        const closeIndex = closeRange?.start ?? -1
 
         let inner = ''
         if (openEnd !== -1) {
@@ -386,7 +441,6 @@ export function parseBasicBlockToken(
 
         // Parse attrs from the opening tag only
         const attrs: [string, string][] = []
-        const openTag = openEnd !== -1 ? rawHtml.slice(0, openEnd + 1) : rawHtml
         const attrRegex = /\s([\w:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g
         let m
         while ((m = attrRegex.exec(openTag)) !== null) {
@@ -397,13 +451,15 @@ export function parseBasicBlockToken(
           attrs.push([name, value])
         }
 
+        const loading = !options?.final && !selfClosing && closeRange == null
+
         return [
           {
             type: tag,
             tag,
             content: stripWrapperNewlines(inner),
             raw: String(fromSource?.raw ?? htmlBlockNode.raw ?? rawHtml),
-            loading: htmlBlockNode.loading,
+            loading,
             attrs: attrs.length ? attrs : undefined,
           } as ParsedNode,
           index + 1,

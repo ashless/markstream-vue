@@ -1,6 +1,12 @@
-# API 指南
+---
+description: 查阅 markstream-vue 的底层 API，包括解析器工具、渲染流程选择、作用域覆盖与 AST 级接入能力。
+---
 
-本页串联解析器工具、渲染器 props 与自定义钩子，帮助你快速定位入口。搭配 [使用示例](/zh/guide/usage) 与 [props](/zh/guide/props) 页面一起阅读效果更佳。
+# API 参考
+
+本页聚焦 `markstream-vue` 的底层入口：解析器工具、渲染流程选择，以及作用域覆盖相关钩子。
+
+如果你是想查 `MarkdownRender`、`CodeBlockNode`、`ImageNode` 这类导出的 Vue 组件，请优先看 [渲染器与节点组件](/zh/guide/components)。搭配 [使用示例](/zh/guide/usage) 与 [props](/zh/guide/props) 页面一起阅读效果更佳。
 
 ## 渲染流程速览
 
@@ -29,17 +35,27 @@ Markdown 字符串 → getMarkdown() → markdown-it-ts 实例
 
 通过 `setCustomComponents(customId?, mapping)` 覆盖任意节点渲染器，再在 `MarkdownRender` 上传入匹配的 `custom-id`，即可限定覆盖范围。
 
-```ts
+```ts twoslash
+import type { Component } from 'vue'
 import { setCustomComponents } from 'markstream-vue'
-import CustomImageNode from './CustomImageNode.vue'
+
+declare const CustomImageNode: Component
 
 setCustomComponents('docs', {
   image: CustomImageNode,
 })
 ```
 
-```vue
-<MarkdownRender custom-id="docs" :content="md" />
+```vue twoslash
+<script setup lang="ts">
+import MarkdownRender from 'markstream-vue'
+
+const md = '![demo](https://example.com/demo.png)'
+</script>
+
+<template>
+  <MarkdownRender custom-id="docs" :content="md" />
+</template>
 ```
 
 提示：
@@ -58,19 +74,29 @@ setCustomComponents('docs', {
 
 示例：把 AI “thinking” 标签直接渲染成自定义组件（无需钩子）
 
-```ts
+```ts twoslash
+import type { Component } from 'vue'
 import { setCustomComponents } from 'markstream-vue'
-import ThinkingNode from './ThinkingNode.vue'
+
+declare const ThinkingNode: Component
 
 setCustomComponents('docs', { thinking: ThinkingNode })
 ```
 
-```vue
-<MarkdownRender
-  custom-id="docs"
-  :custom-html-tags="['thinking']"
-  :content="doc"
-/>
+```vue twoslash
+<script setup lang="ts">
+import MarkdownRender from 'markstream-vue'
+
+const doc = '<thinking>Need a plan</thinking>'
+</script>
+
+<template>
+  <MarkdownRender
+    custom-id="docs"
+    :custom-html-tags="['thinking']"
+    :content="doc"
+  />
+</template>
 ```
 
 如果你需要进一步改造 `thinking` 节点（剥掉包裹、重映射 attrs、合并分段等），可使用上述 hooks，或在解析后自行处理 AST。

@@ -1,6 +1,12 @@
-# API guide
+---
+description: Reference the low-level markstream-vue API for parser helpers, render-pipeline decisions, scoped overrides, and AST-aware integration points.
+---
 
-This page connects the parser helpers, renderer props, and customization hooks exposed by `markstream-vue`. Pair it with the [Usage](/guide/usage) and [Props](/guide/props) pages when wiring everything together.
+# API Reference
+
+This page covers the low-level entry points behind `markstream-vue`: parser helpers, render-pipeline decisions, and scoping hooks.
+
+If you are trying to look up exported Vue components such as `MarkdownRender`, `CodeBlockNode`, or `ImageNode`, use [Renderer & Node Components](/guide/components) instead. Pair this page with [Usage](/guide/usage) and [Props](/guide/props) when wiring everything together.
 
 ## Render pipeline at a glance
 
@@ -29,17 +35,27 @@ Both helpers are framework-agnostic and can run in Node or the browser. For larg
 
 Use `setCustomComponents(customId?, mapping)` to override any node renderer. Pair it with the `custom-id` prop on `MarkdownRender` so replacements stay scoped.
 
-```ts
+```ts twoslash
+import type { Component } from 'vue'
 import { setCustomComponents } from 'markstream-vue'
-import CustomImageNode from './CustomImageNode.vue'
+
+declare const CustomImageNode: Component
 
 setCustomComponents('docs', {
   image: CustomImageNode,
 })
 ```
 
-```vue
-<MarkdownRender custom-id="docs" :content="md" />
+```vue twoslash
+<script setup lang="ts">
+import MarkdownRender from 'markstream-vue'
+
+const md = '![demo](https://example.com/demo.png)'
+</script>
+
+<template>
+  <MarkdownRender custom-id="docs" :content="md" />
+</template>
 ```
 
 Tips:
@@ -59,19 +75,29 @@ If you need to reshape the AST, post-process the returned nodes and pass them to
 
 Example: render AI “thinking” tags as custom components (no hooks needed):
 
-```ts
+```ts twoslash
+import type { Component } from 'vue'
 import { setCustomComponents } from 'markstream-vue'
-import ThinkingNode from './ThinkingNode.vue'
+
+declare const ThinkingNode: Component
 
 setCustomComponents('docs', { thinking: ThinkingNode })
 ```
 
-```vue
-<MarkdownRender
-  custom-id="docs"
-  :custom-html-tags="['thinking']"
-  :content="doc"
-/>
+```vue twoslash
+<script setup lang="ts">
+import MarkdownRender from 'markstream-vue'
+
+const doc = '<thinking>Need a plan</thinking>'
+</script>
+
+<template>
+  <MarkdownRender
+    custom-id="docs"
+    :custom-html-tags="['thinking']"
+    :content="doc"
+  />
+</template>
 ```
 
 Hooks remain useful if you want to reshape the emitted `thinking` node (strip wrappers, remap attrs, merge blocks, etc.), or post-process the parsed nodes before rendering.

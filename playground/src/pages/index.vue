@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import type { StreamSliceMode } from '../composables/createLocalTextStream'
+import type { StreamPresetId } from '../composables/streamPresets'
+import type { StreamTransportMode } from '../composables/useStreamSimulator'
 import { Icon } from '@iconify/vue'
 import { useRouter } from 'vue-router'
 import { getUseMonaco } from '../../../src/components/CodeBlockNode/monaco'
@@ -9,11 +12,13 @@ import { setKaTeXWorker } from '../../../src/workers/katexWorkerClient'
 import MermaidWorker from '../../../src/workers/mermaidParser.worker?worker&inline'
 import { setMermaidWorker } from '../../../src/workers/mermaidWorkerClient'
 import ThinkingNode from '../components/ThinkingNode.vue'
+import { CUSTOM_STREAM_PRESET_ID, findMatchingStreamPreset, getStreamPreset, STREAM_PRESETS } from '../composables/streamPresets'
+import { clampStreamControl, normalizeStreamRange, useStreamSimulator } from '../composables/useStreamSimulator'
 import { streamContent } from '../const/markdown'
 import 'katex/dist/katex.min.css'
 // import MarkdownCodeBlockNode from '../../../src/components/MarkdownCodeBlockNode'
 
-const d2Demo = `
+const _d2Demo = `
 
 ## D2 Diagram
 
@@ -26,12 +31,12 @@ DB -> API: rows
 API -> Client: response
 \`\`\`
 `
-const fullStreamContent = `${streamContent}${d2Demo}`
+const fullStreamContent = `${streamContent}`
 const diffHideUnchangedRegions = {
   enabled: true,
   contextLineCount: 2,
   minimumLineCount: 4,
-  revealLineCount: 2,
+  revealLineCount: 5,
 } as const
 const playgroundMonacoOptions = {
   renderSideBySide: true,
@@ -44,11 +49,74 @@ const playgroundMonacoOptions = {
   hideUnchangedRegions: diffHideUnchangedRegions,
 } as const
 
-// 每隔 10 毫秒输出一部分内容
-const content = ref<string>('')
-const streamDelay = useLocalStorage<number>('vmr-settings-stream-delay', 16)
-const streamChunkSize = useLocalStorage<number>('vmr-settings-stream-chunk-size', 1)
-const normalizedChunkSize = computed(() => Math.max(1, Math.floor(streamChunkSize.value) || 1))
+const streamChunkDelayMin = useLocalStorage<number>('vmr-settings-stream-delay-min', 14)
+const streamChunkDelayMax = useLocalStorage<number>('vmr-settings-stream-delay-max', 34)
+const streamChunkSizeMin = useLocalStorage<number>('vmr-settings-stream-chunk-size-min', 2)
+const streamChunkSizeMax = useLocalStorage<number>('vmr-settings-stream-chunk-size-max', 7)
+const streamBurstiness = useLocalStorage<number>('vmr-settings-stream-burstiness', 35)
+const streamTransportMode = useLocalStorage<StreamTransportMode>('vmr-settings-stream-transport-mode', 'readable-stream')
+const streamSliceMode = useLocalStorage<StreamSliceMode>('vmr-settings-stream-slice-mode', 'pure-random')
+const normalizedChunkDelayRange = computed(() => normalizeStreamRange(
+  Number(streamChunkDelayMin.value),
+  Number(streamChunkDelayMax.value),
+  8,
+  240,
+  14,
+  34,
+))
+const normalizedChunkSizeRange = computed(() => normalizeStreamRange(
+  Number(streamChunkSizeMin.value),
+  Number(streamChunkSizeMax.value),
+  1,
+  24,
+  2,
+  7,
+))
+const normalizedBurstiness = computed(() => Math.round(clampStreamControl(Number(streamBurstiness.value), 0, 100, 35)))
+const activeStreamPreset = computed(() => findMatchingStreamPreset({
+  chunkDelayMin: normalizedChunkDelayRange.value.min,
+  chunkDelayMax: normalizedChunkDelayRange.value.max,
+  chunkSizeMin: normalizedChunkSizeRange.value.min,
+  chunkSizeMax: normalizedChunkSizeRange.value.max,
+  burstiness: normalizedBurstiness.value,
+}))
+const selectedStreamPresetId = computed<StreamPresetId>({
+  get: () => activeStreamPreset.value?.id ?? CUSTOM_STREAM_PRESET_ID,
+  set: (presetId) => {
+    if (presetId === CUSTOM_STREAM_PRESET_ID)
+      return
+
+    const preset = getStreamPreset(presetId)
+    if (!preset)
+      return
+
+    streamChunkDelayMin.value = preset.chunkDelayMin
+    streamChunkDelayMax.value = preset.chunkDelayMax
+    streamChunkSizeMin.value = preset.chunkSizeMin
+    streamChunkSizeMax.value = preset.chunkSizeMax
+    streamBurstiness.value = preset.burstiness
+  },
+})
+const streamPresetDescription = computed(() => activeStreamPreset.value?.description ?? 'Custom min/max window with your own burst profile.')
+const streamChunkRangeLabel = computed(() => `${normalizedChunkSizeRange.value.min}-${normalizedChunkSizeRange.value.max}`)
+const streamDelayRangeLabel = computed(() => `${normalizedChunkDelayRange.value.min}-${normalizedChunkDelayRange.value.max}ms`)
+const {
+  content,
+  isPaused,
+  isStreaming,
+  start: startStreamSimulation,
+  stop: stopStreamSimulation,
+  togglePause: toggleStreamPause,
+} = useStreamSimulator({
+  source: fullStreamContent,
+  chunkSizeMin: computed(() => normalizedChunkSizeRange.value.min),
+  chunkSizeMax: computed(() => normalizedChunkSizeRange.value.max),
+  chunkDelayMin: computed(() => normalizedChunkDelayRange.value.min),
+  chunkDelayMax: computed(() => normalizedChunkDelayRange.value.max),
+  burstiness: computed(() => normalizedBurstiness.value / 100),
+  sliceMode: streamSliceMode,
+  transportMode: streamTransportMode,
+})
 
 // 预加载 Monaco 编辑器
 getUseMonaco()
@@ -71,35 +139,25 @@ function goToCdnPeers() {
 
 // Keep persisted values within reasonable bounds on hydration.
 watchEffect(() => {
-  const parsedDelay = Number(streamDelay.value)
-  const fallbackDelay = Number.isFinite(parsedDelay) ? parsedDelay : 16
-  const boundedDelay = Math.min(200, Math.max(4, fallbackDelay))
-  if (streamDelay.value !== boundedDelay)
-    streamDelay.value = boundedDelay
+  if (streamChunkDelayMin.value !== normalizedChunkDelayRange.value.min)
+    streamChunkDelayMin.value = normalizedChunkDelayRange.value.min
+  if (streamChunkDelayMax.value !== normalizedChunkDelayRange.value.max)
+    streamChunkDelayMax.value = normalizedChunkDelayRange.value.max
 })
 
 watchEffect(() => {
-  const parsedChunk = Number(streamChunkSize.value)
-  const fallbackChunk = Number.isFinite(parsedChunk) ? parsedChunk : 1
-  const normalizedChunk = Math.floor(fallbackChunk) || 1
-  const boundedChunk = Math.min(16, Math.max(1, normalizedChunk))
-  if (streamChunkSize.value !== boundedChunk)
-    streamChunkSize.value = boundedChunk
+  if (streamChunkSizeMin.value !== normalizedChunkSizeRange.value.min)
+    streamChunkSizeMin.value = normalizedChunkSizeRange.value.min
+  if (streamChunkSizeMax.value !== normalizedChunkSizeRange.value.max)
+    streamChunkSizeMax.value = normalizedChunkSizeRange.value.max
 })
 
-// To avoid flashing sequences like ":::" during streaming (which later
-// become an AdmonitionNode), we look ahead when encountering ":" and
-// defer appending consecutive colons until a non-colon character is seen.
-useInterval(streamDelay, {
-  callback() {
-    const cur = content.value.length
-    if (cur >= fullStreamContent.length)
-      return
-    const chunkSize = normalizedChunkSize.value
-    const nextChunk = fullStreamContent.slice(cur, cur + chunkSize)
-    // Append chunk-sized slices so users can preview larger batches while streaming.
-    content.value += nextChunk
-  },
+watchEffect(() => {
+  const parsedBurstiness = Number(streamBurstiness.value)
+  const fallbackBurstiness = Number.isFinite(parsedBurstiness) ? parsedBurstiness : 35
+  const boundedBurstiness = Math.round(clampStreamControl(fallbackBurstiness, 0, 100, 35))
+  if (streamBurstiness.value !== boundedBurstiness)
+    streamBurstiness.value = boundedBurstiness
 })
 
 setCustomComponents('playground-demo', { thinking: ThinkingNode })
@@ -182,6 +240,8 @@ function formatThemeName(themeName: string) {
 
 // 设置面板显示状态
 const showSettings = ref(false)
+const isCompactSettings = useMediaQuery('(max-width: 1023px)')
+const shouldShowSettingsPanel = computed(() => !isCompactSettings.value || showSettings.value)
 
 // Use reversed column layout and let the browser handle native scrolling.
 // Removed custom JS scroll management (observers, programmatic scroll, and
@@ -285,6 +345,7 @@ function scheduleCheckMinHeight() {
 }
 
 onMounted(() => {
+  startStreamSimulation()
   // 初始检查和观察
   const container = messagesContainer.value
   if (!container)
@@ -319,6 +380,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stopStreamSimulation()
   __roContainer?.disconnect()
   __roContent?.disconnect()
   __mo?.disconnect()
@@ -326,11 +388,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="flex items-center justify-center p-4 app-container h-full bg-gray-50 dark:bg-gray-900">
+  <div class="flex items-center justify-center p-4 lg:pr-[304px] app-container h-full bg-gray-50 dark:bg-gray-900">
     <!-- 设置按钮和面板 -->
     <div class="fixed top-4 right-4 z-10">
-      <!-- 设置按钮 -->
       <button
+        v-if="isCompactSettings"
         class="
           settings-toggle w-10 h-10 rounded-full
           bg-white/95 dark:bg-gray-800/95
@@ -350,7 +412,6 @@ onBeforeUnmount(() => {
         />
       </button>
 
-      <!-- 设置面板 -->
       <Transition
         enter-active-class="transition ease-out duration-300"
         enter-from-class="opacity-0 scale-95 translate-y-2"
@@ -360,17 +421,27 @@ onBeforeUnmount(() => {
         leave-to-class="opacity-0 scale-95 translate-y-2"
       >
         <div
-          v-if="showSettings"
+          v-if="shouldShowSettingsPanel"
           class="
-            absolute top-12 right-0 mt-2
+            settings-panel
             bg-white/95 dark:bg-gray-800/95
             backdrop-blur-md border border-gray-200/50 dark:border-gray-700/50
             rounded-xl shadow-xl dark:shadow-gray-900/30
-            p-4 space-y-4 min-w-[220px]
+            p-4 space-y-4 min-w-[220px] w-[280px]
+            overflow-y-auto
             origin-top-right
           "
+          :class="isCompactSettings ? 'absolute top-12 right-0 mt-2 max-h-[calc(100vh-5rem)]' : 'max-h-[calc(100vh-2rem)]'"
           @click.stop
         >
+          <div v-if="!isCompactSettings" class="flex items-center gap-2 border-b border-gray-200/70 pb-2 dark:border-gray-700/70">
+            <Icon
+              icon="carbon:settings"
+              class="w-4 h-4 text-gray-500 dark:text-gray-400"
+            />
+            <span class="text-xs font-semibold uppercase tracking-[0.24em] text-gray-500 dark:text-gray-400">Settings</span>
+          </div>
+
           <!-- 主题选择器 -->
           <div class="space-y-2">
             <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
@@ -409,42 +480,211 @@ onBeforeUnmount(() => {
           <!-- 流式速度控制 -->
           <div class="space-y-2">
             <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
-              Stream Delay
+              Stream Profile
+            </label>
+            <div class="relative">
+              <select
+                v-model="selectedStreamPresetId"
+                class="
+                  w-full appearance-none px-3 py-2 pr-8
+                  bg-gray-50 dark:bg-gray-700/50
+                  border border-gray-200 dark:border-gray-600
+                  rounded-lg text-sm font-medium
+                  text-gray-900 dark:text-gray-100
+                  hover:bg-gray-100 dark:hover:bg-gray-700
+                  focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500
+                  transition-all duration-200 cursor-pointer
+                "
+              >
+                <option v-for="preset in STREAM_PRESETS" :key="preset.id" :value="preset.id">
+                  {{ preset.label }}
+                </option>
+                <option :value="CUSTOM_STREAM_PRESET_ID">
+                  Custom
+                </option>
+              </select>
+              <div class="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none">
+                <Icon
+                  icon="carbon:chevron-down"
+                  class="w-4 h-4 text-gray-400 dark:text-gray-500"
+                />
+              </div>
+            </div>
+            <p class="text-[11px] leading-5 text-gray-500 dark:text-gray-400">
+              {{ streamPresetDescription }}
+            </p>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              Transport
+            </label>
+            <div class="relative">
+              <select
+                v-model="streamTransportMode"
+                class="
+                  w-full appearance-none px-3 py-2 pr-8
+                  bg-gray-50 dark:bg-gray-700/50
+                  border border-gray-200 dark:border-gray-600
+                  rounded-lg text-sm font-medium
+                  text-gray-900 dark:text-gray-100
+                  hover:bg-gray-100 dark:hover:bg-gray-700
+                  focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500
+                  transition-all duration-200 cursor-pointer
+                "
+              >
+                <option value="readable-stream">
+                  ReadableStream
+                </option>
+                <option value="scheduler">
+                  Scheduler
+                </option>
+              </select>
+              <div class="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none">
+                <Icon
+                  icon="carbon:chevron-down"
+                  class="w-4 h-4 text-gray-400 dark:text-gray-500"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              Slice Mode
+            </label>
+            <div class="relative">
+              <select
+                v-model="streamSliceMode"
+                class="
+                  w-full appearance-none px-3 py-2 pr-8
+                  bg-gray-50 dark:bg-gray-700/50
+                  border border-gray-200 dark:border-gray-600
+                  rounded-lg text-sm font-medium
+                  text-gray-900 dark:text-gray-100
+                  hover:bg-gray-100 dark:hover:bg-gray-700
+                  focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500
+                  transition-all duration-200 cursor-pointer
+                "
+              >
+                <option value="pure-random">
+                  Pure Random
+                </option>
+                <option value="boundary-aware">
+                  Boundary Aware
+                </option>
+              </select>
+              <div class="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none">
+                <Icon
+                  icon="carbon:chevron-down"
+                  class="w-4 h-4 text-gray-400 dark:text-gray-500"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              chunkDelayMin
             </label>
             <div class="flex items-center gap-3">
               <input
-                v-model.number="streamDelay"
+                v-model.number="streamChunkDelayMin"
                 type="range"
-                min="4"
-                max="200"
+                min="8"
+                max="240"
                 step="4"
                 class="flex-1 cursor-pointer"
               >
-              <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-12 text-right">
-                {{ streamDelay }}ms
+              <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-14 text-right">
+                {{ normalizedChunkDelayRange.min }}ms
               </span>
             </div>
           </div>
 
-          <!-- 流式字符数量控制 -->
           <div class="space-y-2">
             <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
-              Chunk Size
+              chunkDelayMax
             </label>
             <div class="flex items-center gap-3">
               <input
-                v-model.number="streamChunkSize"
+                v-model.number="streamChunkDelayMax"
+                type="range"
+                min="8"
+                max="240"
+                step="4"
+                class="flex-1 cursor-pointer"
+              >
+              <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-14 text-right">
+                {{ normalizedChunkDelayRange.max }}ms
+              </span>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              chunkSizeMin
+            </label>
+            <div class="flex items-center gap-3">
+              <input
+                v-model.number="streamChunkSizeMin"
                 type="range"
                 min="1"
-                max="16"
+                max="24"
+                step="1"
+                class="flex-1 cursor-pointer"
+              >
+              <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-14 text-right">
+                {{ normalizedChunkSizeRange.min }}
+              </span>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              chunkSizeMax
+            </label>
+            <div class="flex items-center gap-3">
+              <input
+                v-model.number="streamChunkSizeMax"
+                type="range"
+                min="1"
+                max="24"
+                step="1"
+                class="flex-1 cursor-pointer"
+              >
+              <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-14 text-right">
+                {{ normalizedChunkSizeRange.max }}
+              </span>
+            </div>
+          </div>
+
+          <div class="space-y-2">
+            <label class="block text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">
+              Burstiness
+            </label>
+            <div class="flex items-center gap-3">
+              <input
+                v-model.number="streamBurstiness"
+                type="range"
+                min="0"
+                max="100"
                 step="1"
                 class="flex-1 cursor-pointer"
               >
               <span class="text-xs font-medium text-gray-600 dark:text-gray-400 w-12 text-right">
-                {{ normalizedChunkSize }}
+                {{ normalizedBurstiness }}%
               </span>
             </div>
           </div>
+
+          <p class="text-[11px] leading-5 text-gray-500 dark:text-gray-400">
+            Active window: {{ streamChunkRangeLabel }} chars and {{ streamDelayRangeLabel }}. When min=max, the cadence becomes fixed.
+          </p>
+
+          <p class="text-[11px] leading-5 text-gray-500 dark:text-gray-400">
+            `Pure Random` uses raw random `slice`; `Boundary Aware` snaps toward word and punctuation boundaries. `ReadableStream` is closest to the real reader path.
+          </p>
 
           <!-- 分割线 -->
           <div class="border-t border-gray-200 dark:border-gray-700" />
@@ -561,6 +801,16 @@ onBeforeUnmount(() => {
             </a>
 
             <!-- Test Page Button -->
+            <button
+              class="ml-2 flex items-center gap-2 px-3 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:bg-gray-200 dark:disabled:bg-gray-700 text-white disabled:text-gray-500 dark:disabled:text-gray-400 text-sm font-medium rounded-lg transition-all duration-200 shadow-md disabled:shadow-none focus:outline-none focus:ring-2 focus:ring-blue-500/50 disabled:cursor-not-allowed"
+              :disabled="!isStreaming"
+              :title="isPaused ? 'Resume streaming' : 'Pause streaming'"
+              @click="toggleStreamPause"
+            >
+              <Icon :icon="isPaused ? 'carbon:play-filled-alt' : 'carbon:pause-filled'" class="w-4 h-4" />
+              <span>{{ isPaused ? 'Resume' : 'Pause' }}</span>
+            </button>
+
             <button
               class="ml-2 test-page-btn flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg transition-all duration-200 shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500/50"
               title="Go to Test page"

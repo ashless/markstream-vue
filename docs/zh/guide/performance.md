@@ -1,3 +1,7 @@
+---
+description: 优化 markstream-vue 在流式聊天、大文档、Monaco 代码块以及 Mermaid 和 KaTeX 重内容场景下的性能表现。
+---
+
 # 性能特性与建议
 
 本渲染器针对流式与大型文档进行优化。
@@ -30,7 +34,7 @@
 
 有些 LLM 会一次推送大量文本，导致前端表现为“卡顿一会儿再一次性显示”。想让用户始终看到稳定、连续的输出，可以：
 
-- **保持 `typewriter` 为默认开启**，这样非代码节点会通过进入动画平滑呈现，而不是瞬间跳出。
+- **保持 `typewriter` 为默认开启**，这样非代码节点会通过淡入动画平滑呈现，而不是瞬间跳出；流式追加出来的新文本片段也会补一段局部短 fade，不会把整块一起压暗。
 - **调整批次渲染参数**：调低 `initialRenderBatchSize` / `renderBatchSize`（如 `12` / `24`），并设置一个 20–30 ms 的 `renderBatchDelay`，让每次渲染只插入很小的一段文本。
 - **在上游做节流或拆包**：把后端一次性推送的大段文本按段落拆分，或用 50–100 ms 的防抖再更新 `content`，减少一次性 diff。
 - **保留延迟可见渲染**：继续启用 `deferNodesUntilVisible` / `viewportPriority`，避免 Mermaid、Monaco 这类重型节点阻塞文字流。
@@ -49,19 +53,27 @@
 
 示例：在保持可滚动回溯的同时降低 DOM 开销。
 
-```vue
-<MarkdownRender
-  :content="md"
-  :max-live-nodes="220"
-  :live-node-buffer="40"
-  :batch-rendering="true"
-  :initial-render-batch-size="24"
-  :render-batch-size="48"
-  :render-batch-delay="24"
-  :render-batch-budget-ms="8"
-  :defer-nodes-until-visible="true"
-  :viewport-priority="true"
-/>
+```vue twoslash
+<script setup lang="ts">
+import MarkdownRender from 'markstream-vue'
+
+const md = '# Virtualized transcript'
+</script>
+
+<template>
+  <MarkdownRender
+    :content="md"
+    :max-live-nodes="220"
+    :live-node-buffer="40"
+    :batch-rendering="true"
+    :initial-render-batch-size="24"
+    :render-batch-size="48"
+    :render-batch-delay="24"
+    :render-batch-budget-ms="8"
+    :defer-nodes-until-visible="true"
+    :viewport-priority="true"
+  />
+</template>
 ```
 
 利用这些旋钮，可以把超长 AI 对话或技术文档维持在一个稳定的 CPU / 内存预算中，同时保持滚动与输入的流畅体验。

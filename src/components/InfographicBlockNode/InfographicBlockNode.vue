@@ -30,11 +30,33 @@ const { t } = useSafeI18n()
 const copyText = ref(false)
 const isCollapsed = ref(false)
 const infographicContainer = ref<HTMLElement>()
-const showSource = ref(false)
+const showSource = ref(true)
+const userToggledShowSource = ref(false)
 const containerHeight = ref<string>('360px')
 const isModalOpen = ref(false)
 const modalContent = ref<HTMLElement>()
 const modalCloneWrapper = ref<HTMLElement | null>(null)
+const hasPreview = ref(false)
+
+function resolveContainerHeight(actualHeight: number) {
+  if (!props.maxHeight || props.maxHeight === 'none')
+    return `${actualHeight}px`
+
+  const maxHeight = Number.parseFloat(String(props.maxHeight))
+  if (!Number.isFinite(maxHeight))
+    return `${actualHeight}px`
+
+  return `${Math.min(actualHeight, maxHeight)}px`
+}
+
+function updateContainerHeight() {
+  if (!infographicContainer.value)
+    return
+
+  const actualHeight = infographicContainer.value.scrollHeight
+  if (actualHeight > 0)
+    containerHeight.value = resolveContainerHeight(actualHeight)
+}
 
 // Zoom state
 const zoom = ref(1)
@@ -89,6 +111,7 @@ async function copy() {
 }
 
 function handleSwitchMode(mode: 'preview' | 'source') {
+  userToggledShowSource.value = true
   showSource.value = mode === 'source'
 }
 
@@ -296,19 +319,16 @@ async function renderInfographic() {
 
     // Render the syntax
     infographicInstance.render(baseCode.value)
+    hasPreview.value = true
 
     // Update container height after render
     nextTick(() => {
-      if (infographicContainer.value) {
-        const actualHeight = infographicContainer.value.scrollHeight
-        if (actualHeight > 0) {
-          containerHeight.value = `${Math.min(actualHeight, 800)}px`
-        }
-      }
+      updateContainerHeight()
     })
   }
   catch (error) {
     console.error('Failed to render infographic:', error)
+    hasPreview.value = false
     if (infographicContainer.value) {
       infographicContainer.value.innerHTML = `<div class="text-red-500 p-4">Failed to render infographic: ${error instanceof Error ? error.message : 'Unknown error'}</div>`
     }
@@ -351,7 +371,20 @@ watch(
   },
 )
 
+watch(
+  () => props.maxHeight,
+  () => {
+    if (!showSource.value && !isCollapsed.value) {
+      nextTick(() => {
+        renderInfographic()
+      })
+    }
+  },
+)
+
 onMounted(() => {
+  if (!userToggledShowSource.value)
+    showSource.value = false
   if (!showSource.value && !isCollapsed.value) {
     nextTick(() => {
       renderInfographic()
@@ -379,6 +412,11 @@ const computedButtonStyle = computed(() => {
 })
 
 const isFullscreenDisabled = computed(() => showSource.value || isCollapsed.value)
+const renderMode = computed(() => {
+  if (showSource.value)
+    return 'fallback'
+  return hasPreview.value ? 'preview' : 'pending'
+})
 
 const transformStyle = computed(() => ({
   transform: `translate(${translateX.value}px, ${translateY.value}px) scale(${zoom.value})`,
@@ -398,6 +436,8 @@ watch(
 <template>
   <div
     class="my-4 rounded-lg border overflow-hidden shadow-sm"
+    data-markstream-infographic="1"
+    :data-markstream-mode="renderMode"
     :class="[
       props.isDark ? 'border-gray-700/30' : 'border-gray-200',
       { 'is-rendering': props.loading },

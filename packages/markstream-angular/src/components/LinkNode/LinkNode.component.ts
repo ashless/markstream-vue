@@ -1,22 +1,22 @@
+import type { AfterViewInit, ElementRef, OnChanges, OnDestroy } from '@angular/core'
+import type { AngularRenderableNode, AngularRenderContext } from '../shared/node-helpers'
 import { CommonModule } from '@angular/common'
-import type { AfterViewInit, OnChanges, OnDestroy } from '@angular/core'
 import {
   ChangeDetectionStrategy,
   Component,
-  ElementRef,
+  forwardRef,
   Input,
   ViewChild,
-  forwardRef,
 } from '@angular/core'
 import { hideTooltip, showTooltipForAnchor } from '../../tooltip/singletonTooltip'
 import { NestedRendererComponent } from '../NestedRenderer/NestedRenderer.component'
-import type { AngularRenderContext, AngularRenderableNode } from '../shared/node-helpers'
 import { getNodeList, getString } from '../shared/node-helpers'
+import { TextNodeComponent } from '../TextNode/TextNode.component'
 
 @Component({
   selector: 'markstream-angular-link-node',
   standalone: true,
-  imports: [CommonModule, forwardRef(() => NestedRendererComponent)],
+  imports: [CommonModule, forwardRef(() => NestedRendererComponent), forwardRef(() => TextNodeComponent)],
   template: `
     <a
       *ngIf="!loading; else loadingTpl"
@@ -37,14 +37,26 @@ import { getNodeList, getString } from '../shared/node-helpers'
         [context]="context"
         [indexPrefix]="nestedPrefix"
       />
-      <ng-template #fallbackText>{{ fallbackLabel }}</ng-template>
+      <ng-template #fallbackText>
+        <markstream-angular-text-node
+          [node]="{ type: 'text', content: fallbackLabel }"
+          [context]="context"
+          [indexKey]="nestedPrefix + '-fallback'"
+        />
+      </ng-template>
     </a>
 
     <ng-template #loadingTpl>
       <span class="link-loading" [ngStyle]="cssVars" aria-hidden="false">
         <span class="link-text-wrapper">
-          <span class="link-text">{{ fallbackLabel }}</span>
-          <span class="underline-anim" aria-hidden="true"></span>
+          <span class="link-text">
+            <markstream-angular-text-node
+              [node]="{ type: 'text', content: fallbackLabel }"
+              [context]="context"
+              [indexKey]="nestedPrefix + '-loading'"
+            />
+          </span>
+          <span class="link-loading-indicator" aria-hidden="true"></span>
         </span>
       </span>
     </ng-template>
@@ -98,9 +110,10 @@ export class LinkNodeComponent implements AfterViewInit, OnChanges, OnDestroy {
       '--link-color': '#0366d6',
       '--underline-height': '2px',
       '--underline-bottom': '-3px',
-      '--underline-opacity': '0.9',
-      '--underline-duration': '0.8s',
-      '--underline-timing': 'linear',
+      '--underline-opacity': '0.35',
+      '--underline-rest-opacity': '0.175',
+      '--underline-duration': '1.6s',
+      '--underline-timing': 'ease-in-out',
       '--underline-iteration': 'infinite',
     } as Record<string, string>
   }

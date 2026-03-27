@@ -25,6 +25,7 @@
 ## 目录
 
 - [速览](#速览)
+- [按场景选择入口](#按场景选择入口)
 - [立即试用](#-立即试用)
 - [社区与支持](#-社区与支持)
 - [快速上手](#-快速上手)
@@ -57,6 +58,17 @@
 - 同时支持 **Markdown 字符串或预解析节点**，可在 Markdown 中嵌入 **自定义 Vue 组件**。
 - TypeScript 优先，开箱默认即可上线（导入 CSS 即用）。
 
+## 按场景选择入口
+
+| 如果你现在想做的是... | 先看这里 | 然后看 |
+| --- | --- | --- |
+| 先把第一段渲染跑起来 | [快速上手](#-快速上手) | [安装指南](https://markstream-vue-docs.simonhe.me/zh/guide/installation) |
+| 接到文档站或 VitePress 主题里 | [文档站与 VitePress 集成](https://markstream-vue-docs.simonhe.me/zh/guide/vitepress-docs-integration) | [自定义标签与高级组件](https://markstream-vue-docs.simonhe.me/zh/guide/custom-components) |
+| 做 AI 聊天界面或 SSE 流式输出 | [AI 聊天与流式输出](https://markstream-vue-docs.simonhe.me/zh/guide/ai-chat-streaming) | [性能](https://markstream-vue-docs.simonhe.me/zh/guide/performance) |
+| 替换一个内置节点渲染器 | [覆盖内置组件](https://markstream-vue-docs.simonhe.me/zh/guide/component-overrides) | [渲染器与节点组件](https://markstream-vue-docs.simonhe.me/zh/guide/components) |
+| 增加 `thinking` 这类可信标签 | [自定义标签与高级组件](https://markstream-vue-docs.simonhe.me/zh/guide/custom-components) | [API 参考](https://markstream-vue-docs.simonhe.me/zh/guide/api) |
+| 接入坏了但还不知道原因 | [按症状排查](https://markstream-vue-docs.simonhe.me/zh/guide/troubleshooting-path) | [排查问题](https://markstream-vue-docs.simonhe.me/zh/guide/troubleshooting) |
+
 ## 🚀 立即试用
 
 - Playground（交互演示）： https://markstream-vue.simonhe.me/
@@ -69,6 +81,37 @@
 - Nuxt playground：`pnpm play:nuxt`
 - Discord： https://discord.gg/vkzdkjeRCW
 
+## skills 和 prompts 的 CLI
+
+如果你想直接拿到打包后的 AI 资产，而不是先克隆仓库：
+
+```bash
+npx skills add Simon-He95/markstream-vue
+npx markstream-vue skills list
+npx markstream-vue skills install
+npx markstream-vue prompts list
+npx markstream-vue prompts show install-markstream
+```
+
+推荐这样理解：
+
+- `npx skills add Simon-He95/markstream-vue` 是最推荐的安装方式，因为它会直接读取 GitHub 仓库里的 `.agents/skills`
+- `skills install` 会把打包好的 skills 安装到你的 agent skills 目录，默认是 `~/.agents/skills`
+- `prompts list` / `prompts show` 用来发现并直接复制官方维护的 prompt 模板
+
+`npx skills add` 也支持这些来源：
+
+```bash
+# 完整 GitHub URL
+npx skills add https://github.com/Simon-He95/markstream-vue
+
+# 仓库里的单个 skill 直链
+npx skills add https://github.com/Simon-He95/markstream-vue/tree/main/.agents/skills/markstream-install
+
+# 任意 git URL
+npx skills add git@github.com:Simon-He95/markstream-vue.git
+```
+
 ## 💬 社区与支持
 
 - Discussions：https://github.com/Simon-He95/markstream-vue/discussions
@@ -76,6 +119,14 @@
 - Issues：请使用模板并附上复现链接（https://markstream-vue.simonhe.me/test）
 
 测试页内置编辑器 + 实时预览，并提供“生成分享链接”功能（过长内容会回退为直接打开或预填 GitHub Issue）。
+
+## 支持项目
+
+如果 markstream-vue 对你的工作有帮助，欢迎通过下面的收款码支持项目的持续维护。
+
+| 支付宝 | 微信收款 |
+| --- | --- |
+| <img src="https://raw.githubusercontent.com/Simon-He95/markstream-vue/main/docs/public/sponsor/zhifubao.jpg" alt="支付宝收款码" width="240" /> | <img src="https://raw.githubusercontent.com/Simon-He95/markstream-vue/main/docs/public/sponsor/weixin.jpg" alt="微信收款码" width="240" /> |
 
 ## ⚡ 快速上手
 

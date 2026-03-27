@@ -3,7 +3,7 @@ import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-mark
 import type { VisibilityHandle } from '../../composables/viewportPriority'
 import type { D2BlockNodeProps, InfographicBlockNodeProps, MermaidBlockNodeProps } from '../../types/component-props'
 import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
-import { computed, getCurrentInstance, markRaw, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue-demi'
+import { computed, getCurrentInstance, markRaw, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue-demi'
 import AdmonitionNode from '../../components/AdmonitionNode'
 import BlockquoteNode from '../../components/BlockquoteNode'
 import CheckboxNode from '../../components/CheckboxNode'
@@ -150,6 +150,32 @@ const SCROLL_PARENT_OVERFLOW_RE = /auto|scroll|overlay/i
 const isClient = typeof window !== 'undefined'
 const instance = getCurrentInstance()
 const debugPerformanceEnabled = computed(() => props.debugPerformance && isClient && typeof console !== 'undefined')
+const attrs = computed<Record<string, unknown>>(() => ((instance?.proxy as any)?.$attrs ?? {}) as Record<string, unknown>)
+const textStreamState = new Map<string, string>()
+const streamRenderVersion = ref(0)
+const resolvedShowTooltips = computed<boolean | undefined>(() => {
+  if (typeof props.showTooltips === 'boolean')
+    return props.showTooltips
+  const raw = attrs.value.showTooltips ?? attrs.value['show-tooltips']
+  if (raw === '' || raw === true || raw === 'true')
+    return true
+  if (raw === false || raw === 'false')
+    return false
+  return undefined
+})
+
+provide('markstreamShowTooltips', resolvedShowTooltips)
+provide('markstreamTypewriter', computed(() => props.typewriter !== false))
+provide('markstreamTextStreamState', textStreamState)
+provide('markstreamStreamVersion', streamRenderVersion)
+
+watch(
+  [() => props.content, () => props.nodes],
+  () => {
+    streamRenderVersion.value += 1
+  },
+  { immediate: true },
+)
 
 function logPerf(label: string, data: Record<string, unknown>) {
   if (!debugPerformanceEnabled.value)
@@ -261,6 +287,14 @@ const mergedParseOptions = computed(() => {
     ...(hasFinal ? { final: resolvedFinal } : {}),
     ...(hasCustom ? { customHtmlTags: Array.from(new Set(merged)) } : {}),
   } as ParseOptions
+})
+
+// Set of effective custom HTML tags (normalised to lowercase).
+// Used in `renderedItems` to coerce pre-parsed html_block/html_inline nodes
+// whose tag matches a registered custom component.
+const effectiveCustomHtmlTagsSet = computed<Set<string>>(() => {
+  const arr: string[] = (mergedParseOptions.value as any).customHtmlTags ?? []
+  return new Set(arr.map(t => String(t).trim().toLowerCase()).filter(Boolean))
 })
 
 const parsedNodes = computed<ParsedNode[]>(() => {
@@ -1624,14 +1658,40 @@ const listBindings = computed(() => ({
 const legacyRenderedItems = computed(() => {
   return legacyNodeItems.value.map((node, index) => {
     const language = getCodeBlockLanguage(node)
+    let resolvedNode = node
+    let component = getNodeComponent(node, language)
+
+    // Coerce html_block/html_inline nodes whose tag matches a registered
+    // custom component listed in customHtmlTags.
+    if (
+      (node.type === 'html_block' || node.type === 'html_inline')
+      && component === (nodeComponents as any)[node.type]
+    ) {
+      const tag = String((node as any).tag ?? '').trim().toLowerCase()
+        || getHtmlTagFromContent((node as any).content)
+      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
+        const customComponents = customComponentsMap.value
+        const customForTag = (customComponents as any)[tag]
+        if (customForTag) {
+          component = customForTag
+          resolvedNode = {
+            ...(node as any),
+            type: tag,
+            tag,
+            content: stripCustomHtmlWrapper((node as any).content, tag),
+          } as ParsedNode
+        }
+      }
+    }
+
     return {
-      node,
-      component: getNodeComponent(node, language),
-      bindings: getBindingsFor(node, language),
-      isCodeBlock: node.type === 'code_block',
+      node: resolvedNode,
+      component,
+      bindings: getBindingsFor(resolvedNode, language),
+      isCodeBlock: resolvedNode.type === 'code_block',
       index,
       indexKey: `${indexPrefix.value}-${index}`,
-      renderKey: getRenderKey(node, index),
+      renderKey: getRenderKey(resolvedNode, index),
     }
   })
 })
@@ -1642,12 +1702,37 @@ const legacyStructuredContentMode = computed(() => {
 })
 const renderedItems = computed(() => {
   return visibleNodes.value.map((item) => {
-    const node = getCodeBlockRenderNode(item.node)
+    let node = getCodeBlockRenderNode(item.node)
     const language = getCodeBlockLanguage(node)
+    let component = getNodeComponent(node, language)
+
+    // Coerce html_block/html_inline nodes whose tag matches a registered
+    // custom component listed in customHtmlTags.
+    if (
+      (node.type === 'html_block' || node.type === 'html_inline')
+      && component === (nodeComponents as any)[node.type]
+    ) {
+      const tag = String((node as any).tag ?? '').trim().toLowerCase()
+        || getHtmlTagFromContent((node as any).content)
+      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
+        const customComponents = customComponentsMap.value
+        const customForTag = (customComponents as any)[tag]
+        if (customForTag) {
+          component = customForTag
+          node = {
+            ...(node as any),
+            type: tag,
+            tag,
+            content: stripCustomHtmlWrapper((node as any).content, tag),
+          } as ParsedNode
+        }
+      }
+    }
+
     return {
       ...item,
       node,
-      component: getNodeComponent(node, language),
+      component,
       bindings: getBindingsFor(node, language),
       isCodeBlock: node.type === 'code_block',
       indexKey: `${indexPrefix.value}-${item.index}`,
@@ -1678,6 +1763,23 @@ function getCodeBlockRenderNode(node: ParsedNode) {
   const cloned = { ...codeBlockNode } as ParsedNode
   codeBlockRenderCache.set(codeBlockNode, { signature, node: cloned })
   return cloned
+}
+
+function getHtmlTagFromContent(html: unknown) {
+  const raw = String(html ?? '')
+  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
+  return match ? match[1].toLowerCase() : ''
+}
+
+function stripCustomHtmlWrapper(html: unknown, tag: string) {
+  const raw = String(html ?? '')
+  if (!tag)
+    return raw
+  // Escape special regex characters to prevent unexpected behavior.
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const openRe = new RegExp(String.raw`^\s*<\s*${escaped}(?:\s[^>]*)?>\s*`, 'i')
+  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${escaped}\s*>\s*$`, 'i')
+  return raw.replace(openRe, '').replace(closeRe, '')
 }
 
 function getCodeBlockLanguage(node: ParsedNode) {
@@ -1712,6 +1814,11 @@ function getRenderKey(node: ParsedNode, index: number) {
     return base
 
   const type = String((node as any).type || 'unknown')
+  // Keep streaming code blocks on a stable key so Monaco-backed components
+  // receive prop updates instead of being torn down and recreated per chunk.
+  if (type === 'code_block')
+    return base
+
   const loading = (node as any).loading === true
   const raw = typeof (node as any).raw === 'string' ? (node as any).raw.length : 0
   const content = typeof (node as any).content === 'string' ? (node as any).content.length : 0
@@ -1884,6 +1991,7 @@ function handleContainerMouseout(event: MouseEvent) {
       :code-block-props="props.codeBlockProps"
       :themes="props.themes"
       :is-dark="props.isDark"
+      :custom-html-tags="props.customHtmlTags"
       @copy="emit('copy', $event)"
       @handle-artifact-click="emit('handleArtifactClick', $event)"
     />

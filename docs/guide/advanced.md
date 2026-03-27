@@ -1,6 +1,12 @@
-# Advanced customization — parseOptions & custom nodes
+# Advanced parser hooks & low-level customization
 
-This page explains how to customize parsing and provide scoped custom components.
+This page is for low-level parser work: token transforms, AST reshaping, and custom node pipelines.
+
+If you only need one of these common tasks, start elsewhere first:
+
+- Replace a built-in renderer such as `image`, `code_block`, or `mermaid`: [Override Built-in Components](/guide/component-overrides)
+- Support trusted tags such as `thinking`: [Custom Tags & Advanced Components](/guide/custom-components)
+- Tune behavior without replacing renderers: [Props & Options](/guide/props)
 
 ## parseOptions
 `parseOptions` can be passed to `MarkdownRender` or used directly with `parseMarkdownToStructure`.
@@ -71,7 +77,7 @@ Advanced hooks are a powerful way to add domain-specific grammar to Markdown wit
 
 ### Typewriter prop
 
-`MarkdownRender` accepts a `typewriter` boolean prop which controls whether non-`code_block` nodes are wrapped with a small enter transition. This is useful for demo UIs but may be undesirable in SSR or print/export flows where deterministic output is needed.
+`MarkdownRender` accepts a `typewriter` boolean prop which controls whether non-`code_block` nodes use subtle fade treatment. New nodes still get the small enter transition, and when streamed text grows in place the newly appended text fragment replays a short fade instead of dimming the whole node container. This is useful for demo UIs but may be undesirable in SSR or print/export flows where deterministic output is needed.
 
 Example:
 
@@ -79,7 +85,7 @@ Example:
 <MarkdownRender :content="markdown" :typewriter="false" />
 ```
 
-CSS variables: `--typewriter-fade-duration` and `--typewriter-fade-ease` are available for theme tuning.
+CSS variables: `--typewriter-fade-duration` and `--typewriter-fade-ease` tune the initial enter transition; `--stream-update-fade-duration` and `--stream-update-fade-ease` tune the short replayed fade used for newly appended streamed text. When the stream-specific variables are not set, the appended-text fade falls back to the same duration and easing as `typewriter`.
 
 ## Internationalization (i18n)
 

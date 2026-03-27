@@ -14,8 +14,23 @@
 
 - `node` — code_block 节点（必需）
 - `loading`、`stream`、`isShowPreview`
-- `monacoOptions` — 会透传给 `stream-monaco`；像 `diffHunkActionsOnHover`、`diffHunkHoverHideDelayMs`、`onDiffHunkAction` 这类 diff 悬浮操作配置都应该放这里
+- `monacoOptions` — 类型为 `CodeBlockMonacoOptions`，会透传给 `stream-monaco`
+  - `diffHideUnchangedRegions`、`diffLineStyle`、`diffAppearance`、`diffUnchangedRegionStyle`、`diffHunkActionsOnHover`、`diffHunkHoverHideDelayMs`、`onDiffHunkAction` 这类 diff 配置都应该放这里
 - 头部控制：`showHeader`、`showCollapseButton`、`showCopyButton`、`showExpandButton`、`showPreviewButton`、`showFontSizeButtons`、`showTooltips`
+
+Monaco diff 模式下的默认行为：
+
+- `diffHideUnchangedRegions: { enabled: true, contextLineCount: 2, minimumLineCount: 4, revealLineCount: 5 }`
+- `diffLineStyle: 'background'`
+- `diffAppearance: 'auto'`
+- `diffUnchangedRegionStyle: 'line-info'`
+- `diffHunkActionsOnHover: true`
+- `diffHunkHoverHideDelayMs: 160`
+
+你可以通过 `monacoOptions` 覆盖这些默认值。
+当 preset 使用 `diffAppearance: 'auto'` 时，`CodeBlockNode` 会先根据当前明暗外观解析成实际的 light/dark，再传给 `stream-monaco`。
+
+Diff 代码块的内置 header 现在也会显示 `- / +` 行数统计。
 
 ## Slots 插槽
 
@@ -38,31 +53,81 @@ pnpm add stream-monaco
 
 ### 基础示例
 
-```vue
-<CodeBlockNode :node="{ type: 'code_block', language: 'js', code: 'console.log(1)', raw: 'console.log(1)' }" />
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'js',
+  code: 'console.log(1)',
+  raw: 'console.log(1)',
+} satisfies CodeBlockNodeProps['node']
+</script>
+
+<template>
+  <CodeBlockNode :node="node" />
+</template>
 ```
 
 ### 替换头部并隐藏复制按钮
 
-```vue
-<CodeBlockNode :node="node" :showCopyButton="false">
-  <template #header-left>
-    <div class="flex items-center">自定义左侧</div>
-  </template>
-  <template #header-right>
-    <button @click="runSnippet">运行</button>
-  </template>
-</CodeBlockNode>
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'js',
+  code: 'console.log(1)',
+  raw: 'console.log(1)',
+} satisfies CodeBlockNodeProps['node']
+
+function runSnippet() {}
+</script>
+
+<template>
+  <CodeBlockNode :node="node" :show-copy-button="false">
+    <template #header-left>
+      <div class="flex items-center">
+        自定义左侧
+      </div>
+    </template>
+    <template #header-right>
+      <button @click="runSnippet">
+        运行
+      </button>
+    </template>
+  </CodeBlockNode>
+</template>
 ```
 
 ### 自定义加载占位符
 
-```vue
-<CodeBlockNode :node="node" :stream="false" :loading="true">
-  <template #loading="{ loading, stream }">
-    <div v-if="loading && !stream">正在加载编辑器资源…</div>
-  </template>
-</CodeBlockNode>
+```vue twoslash
+<script setup lang="ts">
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = {
+  type: 'code_block',
+  language: 'ts',
+  code: 'console.log("loading")',
+  raw: 'console.log("loading")',
+} satisfies CodeBlockNodeProps['node']
+</script>
+
+<template>
+  <CodeBlockNode :node="node" :stream="false" :loading="true">
+    <template #loading="{ loading, stream }">
+      <div v-if="loading && !stream">
+        正在加载编辑器资源…
+      </div>
+    </template>
+  </CodeBlockNode>
+</template>
 ```
 
 ## 主题切换
@@ -72,7 +137,7 @@ pnpm add stream-monaco
 ### 在独立的 Vue 应用中使用 @vueuse/core
 
 ```vue
-<script setup>
+<script setup lang="ts">
 import { useDark, useToggle } from '@vueuse/core'
 import MarkdownRender from 'markstream-vue'
 
@@ -126,7 +191,7 @@ export function useDark() {
 
 ```vue
 <!-- 在任意 .md 文件或组件中 -->
-<script setup>
+<script setup lang="ts">
 import MarkdownRender from 'markstream-vue'
 import { useDark } from '../../.vitepress/theme'
 
@@ -178,7 +243,10 @@ const themes = [
 
 ```vue
 <script setup lang="ts">
-const node = { type: 'code_block', language: 'js', code: 'console.log("hello")', raw: 'console.log("hello")' }
+import type { CodeBlockNodeProps } from 'markstream-vue'
+import { CodeBlockNode } from 'markstream-vue'
+
+const node = { type: 'code_block', language: 'js', code: 'console.log("hello")', raw: 'console.log("hello")' } satisfies CodeBlockNodeProps['node']
 </script>
 
 <template>

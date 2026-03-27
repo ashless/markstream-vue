@@ -1,5 +1,6 @@
+import type { AngularRenderableNode, AngularRenderContext } from '../shared/node-helpers'
 import { CommonModule } from '@angular/common'
-import { ChangeDetectionStrategy, Component, Input, forwardRef } from '@angular/core'
+import { ChangeDetectionStrategy, Component, forwardRef, Input } from '@angular/core'
 import { getCustomNodeComponents } from '../../customComponents'
 import { AdmonitionNodeComponent } from '../AdmonitionNode/AdmonitionNode.component'
 import { BlockquoteNodeComponent } from '../BlockquoteNode/BlockquoteNode.component'
@@ -32,6 +33,13 @@ import { MermaidBlockNodeComponent } from '../MermaidBlockNode/MermaidBlockNode.
 import { ParagraphNodeComponent } from '../ParagraphNode/ParagraphNode.component'
 import { PreCodeNodeComponent } from '../PreCodeNode/PreCodeNode.component'
 import { ReferenceNodeComponent } from '../ReferenceNode/ReferenceNode.component'
+import {
+  coerceBuiltinHtmlNode,
+  coerceCustomHtmlNode,
+  resolveHtmlTag,
+  resolveNodeOutletCodeMode,
+  resolveNodeOutletCustomInputs,
+} from '../shared/node-outlet-helpers'
 import { StrikethroughNodeComponent } from '../StrikethroughNode/StrikethroughNode.component'
 import { StrongNodeComponent } from '../StrongNode/StrongNode.component'
 import { SubscriptNodeComponent } from '../SubscriptNode/SubscriptNode.component'
@@ -40,14 +48,6 @@ import { TableNodeComponent } from '../TableNode/TableNode.component'
 import { TextNodeComponent } from '../TextNode/TextNode.component'
 import { ThematicBreakNodeComponent } from '../ThematicBreakNode/ThematicBreakNode.component'
 import { VmrContainerNodeComponent } from '../VmrContainerNode/VmrContainerNode.component'
-import type { AngularRenderContext, AngularRenderableNode } from '../shared/node-helpers'
-import {
-  coerceBuiltinHtmlNode,
-  coerceCustomHtmlNode,
-  resolveHtmlTag,
-  resolveNodeOutletCodeMode,
-  resolveNodeOutletCustomInputs,
-} from '../shared/node-outlet-helpers'
 
 @Component({
   selector: 'markstream-angular-node-outlet',
@@ -107,8 +107,8 @@ import {
 
     <ng-template #builtinTemplate>
       <ng-container [ngSwitch]="resolvedType">
-        <markstream-angular-text-node *ngSwitchCase="'text'" [node]="node" />
-        <markstream-angular-text-node *ngSwitchCase="'text_special'" [node]="node" />
+        <markstream-angular-text-node *ngSwitchCase="'text'" [node]="node" [context]="context" [indexKey]="indexKey" />
+        <markstream-angular-text-node *ngSwitchCase="'text_special'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-paragraph-node *ngSwitchCase="'paragraph'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-heading-node *ngSwitchCase="'heading'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-blockquote-node *ngSwitchCase="'blockquote'" [node]="node" [context]="context" [indexKey]="indexKey" />
@@ -123,7 +123,7 @@ import {
         <markstream-angular-hardbreak-node *ngSwitchCase="'hardbreak'" />
         <markstream-angular-link-node *ngSwitchCase="'link'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-image-node *ngSwitchCase="'image'" [node]="node" />
-        <markstream-angular-inline-code-node *ngSwitchCase="'inline_code'" [node]="node" />
+        <markstream-angular-inline-code-node *ngSwitchCase="'inline_code'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-strong-node *ngSwitchCase="'strong'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-emphasis-node *ngSwitchCase="'emphasis'" [node]="node" [context]="context" [indexKey]="indexKey" />
         <markstream-angular-strikethrough-node *ngSwitchCase="'strikethrough'" [node]="node" [context]="context" [indexKey]="indexKey" />
@@ -199,12 +199,12 @@ export class NodeOutletComponent {
       return direct
 
     if (this.resolvedType === 'code_block') {
-      if (this.codeMode === 'mermaid' && customComponents?.['mermaid'])
-        return customComponents['mermaid']
-      if (this.codeMode === 'd2' && customComponents?.['d2'])
-        return customComponents['d2']
-      if (this.codeMode === 'infographic' && customComponents?.['infographic'])
-        return customComponents['infographic']
+      if (this.codeMode === 'mermaid' && customComponents?.mermaid)
+        return customComponents.mermaid
+      if (this.codeMode === 'd2' && customComponents?.d2)
+        return customComponents.d2
+      if (this.codeMode === 'infographic' && customComponents?.infographic)
+        return customComponents.infographic
     }
 
     const tag = this.htmlTag

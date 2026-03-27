@@ -2,6 +2,7 @@
 
 markstream-react provides the same powerful components as markstream-vue, but built for React. All components support React 18+ with full TypeScript support.
 
+The root `markstream-react`, `markstream-react/next`, and `markstream-react/server` entrypoints all ship declaration files. Shared renderer and component types such as `NodeRendererProps`, `NodeComponentProps`, `RenderContext`, `RenderNodeFn`, `CustomComponentMap`, `CodeBlockMonacoOptions`, `MarkdownCodeBlockNodeProps`, `ListItemNodeProps`, `HtmlPreviewFrameProps`, `TooltipProps`, `TooltipPlacement`, and `LinkNodeStyleProps` can be imported directly from the entrypoint you use.
 ## Main Component: MarkdownRender
 
 The primary component for rendering markdown content in React.
@@ -53,16 +54,16 @@ The primary component for rendering markdown content in React.
 
 | Prop | Type | Description |
 |------|------|-------------|
-| `codeBlockDarkTheme` | `any` | Monaco dark theme object forwarded to every `CodeBlockNode` |
-| `codeBlockLightTheme` | `any` | Monaco light theme object forwarded to every `CodeBlockNode` |
-| `codeBlockMonacoOptions` | `Record<string, any>` | Options forwarded to `stream-monaco`, including diff hover-action settings like `diffHunkActionsOnHover`, `diffHunkHoverHideDelayMs`, and `onDiffHunkAction` |
+| `codeBlockDarkTheme` | `CodeBlockMonacoTheme` | Monaco dark theme object forwarded to every `CodeBlockNode` |
+| `codeBlockLightTheme` | `CodeBlockMonacoTheme` | Monaco light theme object forwarded to every `CodeBlockNode` |
+| `codeBlockMonacoOptions` | `CodeBlockMonacoOptions` | Options forwarded to `stream-monaco`, including diff hover-action settings like `diffHunkActionsOnHover`, `diffHunkHoverHideDelayMs`, and `onDiffHunkAction` |
 | `codeBlockMinWidth` | `string \| number` | Min width forwarded to `CodeBlockNode` |
 | `codeBlockMaxWidth` | `string \| number` | Max width forwarded to `CodeBlockNode` |
 | `codeBlockProps` | `Record<string, any>` | Extra props forwarded to every code-block renderer (`CodeBlockNode` / `MarkdownCodeBlockNode`) |
 | `mermaidProps` | `Partial<Omit<MermaidBlockNodeProps, 'node' \| 'loading' \| 'isDark'>>` | Extra props forwarded to Mermaid fences and custom `mermaid` renderers |
 | `d2Props` | `Partial<Omit<D2BlockNodeProps, 'node' \| 'loading' \| 'isDark'>>` | Extra props forwarded to D2 fences and custom `d2` renderers |
 | `infographicProps` | `Partial<Omit<InfographicBlockNodeProps, 'node' \| 'loading' \| 'isDark'>>` | Extra props forwarded to infographic fences and custom `infographic` renderers |
-| `themes` | `string[]` | Theme list forwarded to `stream-monaco` |
+| `themes` | `CodeBlockMonacoTheme[]` | Theme list forwarded to `stream-monaco` |
 
 #### Heavy renderer prop forwarding
 
@@ -492,6 +493,8 @@ setKaTeXWorker(new KatexWorker())
 All custom node components receive these props:
 
 ```tsx
+import type { CustomComponentMap, NodeComponentProps, RenderContext, RenderNodeFn } from 'markstream-react'
+
 interface NodeComponentProps<TNode = unknown> {
   node: TNode // The parsed node data
   ctx?: RenderContext // Renderer context (themes, events, flags)
@@ -503,6 +506,8 @@ interface NodeComponentProps<TNode = unknown> {
   children?: React.ReactNode
 }
 ```
+
+`CustomComponentMap` is the typed mapping shape accepted by `setCustomComponents(...)`.
 
 ### Example Custom Component
 
@@ -644,46 +649,27 @@ Code block prop interfaces (`CodeBlockNodeProps`, `MermaidBlockNodeProps`, `D2Bl
 
 ## Next.js Best Practices
 
-### Client-Side Only Rendering
+Use the dedicated Next SSR entrypoints instead of `mounted` guards or `ssr: false`.
 
 ```tsx
-'use client'
-
-import MarkdownRender from 'markstream-react'
-import { useEffect, useState } from 'react'
+import MarkdownRender from 'markstream-react/next'
 
 export default function MarkdownPage() {
-  const [mounted, setMounted] = useState(false)
-
-  useEffect(() => {
-    setMounted(true)
-  }, [])
-
-  if (!mounted) {
-    return <div>Loading...</div>
-  }
-
-  return <MarkdownRender content="# Hello Next.js!" />
+  return <MarkdownRender content="# Hello Next.js!" final />
 }
 ```
 
-### Dynamic Import Pattern
+For a pure server render path:
 
 ```tsx
-import dynamic from 'next/dynamic'
-
-const MarkdownRender = dynamic(
-  () => import('markstream-react').then(mod => mod.default),
-  {
-    ssr: false,
-    loading: () => <div>Loading markdown...</div>
-  }
-)
+import MarkdownRender from 'markstream-react/server'
 
 export default function MarkdownPage() {
-  return <MarkdownRender content="# Hello!" />
+  return <MarkdownRender content="# Hello!" final />
 }
 ```
+
+See [React Next SSR](/guide/react-next-ssr) for the full entrypoint model.
 
 ## Hooks Integration
 

@@ -1,17 +1,16 @@
+import type { AfterViewInit, ElementRef, OnChanges, OnDestroy } from '@angular/core'
+import type { AngularRenderableNode, AngularRenderContext } from '../shared/node-helpers'
 import { CommonModule } from '@angular/common'
-import type { AfterViewInit, OnChanges, OnDestroy } from '@angular/core'
 import {
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
-  ElementRef,
   HostListener,
+  inject,
   Input,
   ViewChild,
-  inject,
 } from '@angular/core'
 import { getInfographic } from '../../optional/infographic'
-import type { AngularRenderContext, AngularRenderableNode } from '../shared/node-helpers'
 import { getString } from '../shared/node-helpers'
 import {
   clampNumber,
@@ -235,6 +234,19 @@ export class InfographicBlockNodeComponent implements AfterViewInit, OnChanges, 
     return resolveCssSize(this.mergedProps.maxHeight, '500px')
   }
 
+  private resolveContainerMinHeight(actualHeight: number) {
+    const boundedHeight = Math.max(actualHeight, 280)
+    const raw = this.mergedProps.maxHeight
+    if (raw == null || raw === 'none')
+      return `${boundedHeight}px`
+
+    const maxHeight = Number.parseFloat(String(raw))
+    if (!Number.isFinite(maxHeight))
+      return `${boundedHeight}px`
+
+    return `${Math.min(boundedHeight, maxHeight)}px`
+  }
+
   get resolvedLoading() {
     if (typeof this.mergedProps.loading === 'boolean')
       return this.mergedProps.loading
@@ -398,7 +410,7 @@ export class InfographicBlockNodeComponent implements AfterViewInit, OnChanges, 
       this.svgMarkup = svg ? svg.outerHTML : ''
       const measuredHeight = host.scrollHeight
       if (measuredHeight > 0)
-        this.containerMinHeight = `${Math.min(Math.max(measuredHeight, 280), 800)}px`
+        this.containerMinHeight = this.resolveContainerMinHeight(measuredHeight)
       this.syncModalPreview()
     }
     catch (error) {

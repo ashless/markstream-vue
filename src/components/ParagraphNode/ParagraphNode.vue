@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useKatexReady } from '../../composables/useKatexReady'
+import { computed } from 'vue'
 import { getCustomNodeComponents } from '../../utils/nodeComponents'
 import CheckboxNode from '../CheckboxNode'
 import EmojiNode from '../EmojiNode'
@@ -20,6 +20,7 @@ import StrikethroughNode from '../StrikethroughNode'
 import StrongNode from '../StrongNode'
 import SubscriptNode from '../SubscriptNode'
 import SuperscriptNode from '../SuperscriptNode'
+import TextNode from '../TextNode'
 
 // Define the type for the node children
 interface NodeChild {
@@ -38,6 +39,20 @@ const props = defineProps<{
   indexKey?: number | string
 }>()
 const overrides = getCustomNodeComponents(props.customId)
+const paragraphTag = computed(() => {
+  if (props.node.children.length === 0)
+    return 'p'
+
+  const isMediaOnlyParagraph = props.node.children.every((child) => {
+    if (child.type === 'image')
+      return true
+    if (child.type !== 'text')
+      return false
+    return String((child as any).content ?? '').trim() === ''
+  })
+
+  return isMediaOnlyParagraph ? 'div' : 'p'
+})
 
 const nodeComponents = {
   inline_code: InlineCodeNode,
@@ -60,30 +75,22 @@ const nodeComponents = {
   reference: ReferenceNode,
   footnote_anchor: FootnoteAnchorNode,
   footnote_reference: FootnoteReferenceNode,
+  text: TextNode,
   ...overrides,
 }
-const katexReady = useKatexReady()
 </script>
 
 <template>
-  <p dir="auto" class="paragraph-node">
-    <template v-for="(child, index) in node.children" :key="`${indexKey || 'paragraph'}-${index}`">
-      <component
-        :is="nodeComponents[child.type]"
-        v-if="child.type !== 'text'"
-        :node="child"
-        :index-key="`${indexKey}-${index}`"
-        :custom-id="props.customId"
-      />
-      <span
-        v-else
-        :class="[katexReady && child.center ? 'text-node-center' : '']"
-        class="whitespace-pre-wrap break-words text-node"
-      >
-        {{ child.content }}
-      </span>
-    </template>
-  </p>
+  <component :is="paragraphTag" dir="auto" class="paragraph-node">
+    <component
+      :is="nodeComponents[child.type]"
+      v-for="(child, index) in node.children"
+      :key="`${indexKey || 'paragraph'}-${index}`"
+      :node="child"
+      :index-key="`${indexKey}-${index}`"
+      :custom-id="props.customId"
+    />
+  </component>
 </template>
 
 <style scoped>
@@ -92,15 +99,5 @@ const katexReady = useKatexReady()
 }
 li .paragraph-node{
   margin: 0;
-}
-.text-node {
-  display: inline;
-  font-weight: inherit;
-  vertical-align: baseline;
-}
-.text-node-center {
-  display: inline-flex;
-  justify-content: center;
-  width: 100%;
 }
 </style>

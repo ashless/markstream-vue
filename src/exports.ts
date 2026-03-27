@@ -1,4 +1,5 @@
 import type { App, Component, Plugin } from 'vue'
+import type { CustomComponents as MarkstreamCustomComponents } from './types'
 import type { LanguageIconResolver } from './utils/languageIcon'
 import { setDefaultMathOptions } from 'stream-markdown-parser'
 import { defineAsyncComponent } from 'vue'
@@ -59,8 +60,19 @@ export type { D2Loader } from './components/D2BlockNode/d2'
 export type { KatexLoader } from './components/MathInlineNode/katex'
 
 export type { MermaidLoader } from './components/MermaidBlockNode/mermaid'
-export type { NodeRendererProps } from './components/NodeRenderer/NodeRenderer.vue'
 export type {
+  CodeBlockDiffAppearance,
+  CodeBlockDiffHideUnchangedRegions,
+  CodeBlockDiffHideUnchangedRegionsOptions,
+  CodeBlockDiffHunkActionContext,
+  CodeBlockDiffHunkActionKind,
+  CodeBlockDiffHunkSide,
+  CodeBlockDiffLineStyle,
+  CodeBlockDiffUnchangedRegionStyle,
+  CodeBlockMonacoLanguage,
+  CodeBlockMonacoOptions,
+  CodeBlockMonacoTheme,
+  CodeBlockMonacoThemeObject,
   CodeBlockNodeProps,
   D2BlockNodeProps,
   ImageNodeProps,
@@ -72,6 +84,7 @@ export type {
   MermaidBlockNodeProps,
   PreCodeNodeProps,
 } from './types/component-props'
+export type { NodeRendererProps } from './types/node-renderer-props'
 // Export centralized props interfaces so they appear in package d.ts
 export * from './utils'
 export * from './workers/katexCdnWorker'
@@ -80,6 +93,8 @@ export * from './workers/mermaidCdnWorker'
 export * from './workers/mermaidWorkerClient'
 export { KATEX_COMMANDS, normalizeStandaloneBackslashT, setDefaultMathOptions } from 'stream-markdown-parser'
 export type { MathOptions } from 'stream-markdown-parser'
+
+export interface CustomComponents extends MarkstreamCustomComponents {}
 
 export {
   AdmonitionNode,

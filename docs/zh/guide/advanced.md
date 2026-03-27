@@ -1,6 +1,12 @@
-# 高级定制 — parseOptions & 自定义节点
+# 高级解析与低层自定义
 
-本页介绍如何自定义解析流程和提供作用域自定义组件。
+这页面向更底层的解析定制：token 变换、AST 后处理，以及自定义节点管线。
+
+如果你只是要完成这些常见任务，建议先去更直接的页面：
+
+- 替换 `image`、`code_block`、`mermaid` 这类内置渲染器： [覆盖内置组件](/zh/guide/component-overrides)
+- 支持 `thinking` 这类可信标签： [自定义标签与高级组件](/zh/guide/custom-components)
+- 只想调现有行为，不想改解析器： [Props 与选项](/zh/guide/props)
 
 ## parseOptions
 `parseOptions` 可传递给 `MarkdownRender` 或直接用于 `parseMarkdownToStructure`。
@@ -71,7 +77,7 @@ setCustomComponents('docs', { thinking: ThinkingNode })
 
 ### Typewriter 属性
 
-`MarkdownRender` 支持 `typewriter` 布尔属性，控制非 `code_block` 节点是否包裹小型 enter 过渡。适用于演示 UI，但在 SSR 或打印/导出场景下可能不需要。
+`MarkdownRender` 支持 `typewriter` 布尔属性，控制非 `code_block` 节点的轻量 fade 表现。新节点仍然会走小型 enter 过渡，而流式过程中原地追加出来的那段新文本也会单独补一段短 fade，不再让整个节点容器一起变暗。适用于演示 UI，但在 SSR 或打印/导出场景下可能不需要。
 
 示例：
 
@@ -79,7 +85,7 @@ setCustomComponents('docs', { thinking: ThinkingNode })
 <MarkdownRender :content="markdown" :typewriter="false" />
 ```
 
-CSS 变量：`--typewriter-fade-duration` 和 `--typewriter-fade-ease` 可用于主题调整。
+CSS 变量：`--typewriter-fade-duration` 和 `--typewriter-fade-ease` 用于首屏 enter 过渡；`--stream-update-fade-duration` 和 `--stream-update-fade-ease` 用于流式追加文本时那段短 fade。若不单独覆盖，流式追加的 fade 会默认沿用 `typewriter` 的时长和缓动。
 
 ## 国际化（i18n）
 

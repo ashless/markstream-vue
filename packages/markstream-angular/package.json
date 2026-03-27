@@ -1,7 +1,7 @@
 {
   "name": "markstream-angular",
   "type": "module",
-  "version": "0.0.1-alpha.0",
+  "version": "0.0.1-alpha.7",
   "description": "Experimental Angular Markdown renderer for Markstream, built on stream-markdown AST and a stable HTML baseline renderer.",
   "author": "Simon He",
   "license": "MIT",
@@ -27,7 +27,7 @@
   ],
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/types/index.d.ts",
       "import": "./dist/index.js"
     },
     "./index.css": "./dist/index.css",
@@ -36,7 +36,7 @@
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "types": "./dist/types/index.d.ts",
   "files": [
     "dist"
   ],
@@ -44,16 +44,18 @@
     "build": "vite build --mode npm",
     "dev": "vite dev",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm run build",
+    "release": "bumpp --commit --no-tag --no-push && pnpm publish --access public && node ../../scripts/tag-package.mjs --package-json package.json --push"
   },
   "peerDependencies": {
-    "@antv/infographic": "^0.2.3",
     "@angular/common": ">=20",
     "@angular/core": ">=20",
+    "@antv/infographic": "^0.2.3",
     "@terrastruct/d2": ">=0.1.33",
     "katex": ">=0.16.22",
     "mermaid": ">=11",
-    "stream-monaco": ">=0.0.18"
+    "stream-monaco": ">=0.0.20"
   },
   "peerDependenciesMeta": {
     "@antv/infographic": {

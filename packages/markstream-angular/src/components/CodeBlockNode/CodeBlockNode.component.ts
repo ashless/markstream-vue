@@ -1,23 +1,22 @@
+import type { AfterViewInit, ElementRef, OnChanges, OnDestroy } from '@angular/core'
+import type { AngularRenderableNode, AngularRenderContext } from '../shared/node-helpers'
 import { CommonModule } from '@angular/common'
-import type { AfterViewInit, OnChanges, OnDestroy } from '@angular/core'
 import {
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
+  inject,
   Input,
   ViewChild,
-  ElementRef,
-  inject,
 } from '@angular/core'
-import type { AngularRenderContext, AngularRenderableNode } from '../shared/node-helpers'
-import { getString } from '../shared/node-helpers'
-import { PreCodeNodeComponent } from '../PreCodeNode/PreCodeNode.component'
-import { HtmlPreviewFrameComponent } from './HtmlPreviewFrame.component'
 import { useSafeI18n } from '../../i18n/useSafeI18n'
 import { getUseMonaco } from '../../optional/monaco'
 import { getLanguageIcon, languageMap, normalizeLanguageIdentifier, resolveMonacoLanguageId } from '../../utils/languageIcon'
+import { PreCodeNodeComponent } from '../PreCodeNode/PreCodeNode.component'
+import { getString } from '../shared/node-helpers'
+import { HtmlPreviewFrameComponent } from './HtmlPreviewFrame.component'
 
-type MonacoHelpers = {
+interface MonacoHelpers {
   createEditor?: (container: HTMLElement, code: string, language: string) => Promise<unknown> | unknown
   createDiffEditor?: (container: HTMLElement, original: string, modified: string, language: string) => Promise<unknown> | unknown
   updateCode?: (code: string, language?: string) => Promise<unknown> | unknown
@@ -37,6 +36,7 @@ type MonacoHelpers = {
     <div
       class="code-block-container"
       [class.is-dark]="resolvedIsDark"
+      [class.is-plain-text]="isPlainTextLanguage"
       [class.is-rendering]="resolvedLoading"
       [attr.data-markstream-monaco]="editorReady && !useFallback ? '1' : null"
       [attr.data-markstream-monaco-diff]="editorReady && isDiff && !useFallback ? '1' : null"
@@ -143,10 +143,10 @@ type MonacoHelpers = {
             (click)="toggleExpanded()"
           >
             <svg *ngIf="expanded" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" width="1em" height="1em" viewBox="0 0 24 24" class="code-action-btn__icon">
-              <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 3h6v6m0-6l-7 7M3 21l7-7m-1 7H3v-6" />
+              <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m14 10l7-7m-1 7h-6V4M3 21l7-7m-6 0h6v6" />
             </svg>
             <svg *ngIf="!expanded" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" width="1em" height="1em" viewBox="0 0 24 24" class="code-action-btn__icon">
-              <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m14 10l7-7m-1 7h-6V4M3 21l7-7m-6 0h6v6" />
+              <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 3h6v6m0-6l-7 7M3 21l7-7m-1 7H3v-6" />
             </svg>
           </button>
 
@@ -340,6 +340,10 @@ export class CodeBlockNodeComponent implements AfterViewInit, OnChanges, OnDestr
 
   get monacoLanguage() {
     return resolveMonacoLanguageId(this.rawLanguage)
+  }
+
+  get isPlainTextLanguage() {
+    return this.monacoLanguage === 'plaintext'
   }
 
   get displayLanguage() {

@@ -411,6 +411,7 @@ describe('markdownRender node e2e coverage', () => {
         const reference = wrapper.find('span.reference-node')
         expect(reference.exists()).toBe(true)
         expect(reference.text()).toBe('1')
+        expect(reference.classes()).toContain('text-[hsl(var(--muted-foreground))]')
       },
     },
     {
@@ -489,6 +490,36 @@ describe('markdownRender node e2e coverage', () => {
     }
     finally {
       removeCustomComponents(scopeId)
+    }
+  })
+
+  it('replays a fade animation when a streamed non-code node updates in place', async () => {
+    const wrapper = await mountMarkdown('Hello')
+    try {
+      const nodeContent = () => wrapper.find('[data-node-index="0"] .node-content')
+      expect(nodeContent().attributes('style') ?? '').toBe('')
+      expect(wrapper.find('.text-node-stream-delta').exists()).toBe(false)
+
+      await wrapper.setProps({ content: 'Hello world' })
+      await flushAll()
+
+      expect(nodeContent().attributes('style') ?? '').toBe('')
+      const firstDelta = wrapper.find('.text-node-stream-delta')
+      expect(firstDelta.exists()).toBe(true)
+      expect(firstDelta.text()).toBe('world')
+      expect(normalizeText(wrapper.text())).toContain('Hello world')
+
+      await wrapper.setProps({ content: 'Hello world again' })
+      await flushAll()
+
+      expect(nodeContent().attributes('style') ?? '').toBe('')
+      const secondDelta = wrapper.find('.text-node-stream-delta')
+      expect(secondDelta.exists()).toBe(true)
+      expect(secondDelta.text()).toBe('again')
+      expect(normalizeText(wrapper.text())).toContain('Hello world again')
+    }
+    finally {
+      wrapper.unmount()
     }
   })
 
@@ -685,6 +716,65 @@ Another paragraph.
       const wrapper = await mountMarkdown(markdown, { customId: scopeId, final: true })
       try {
         expect(normalizeText(wrapper.text())).toMatch(/First\s*X\s*middle\s*Second\s*Y/)
+      }
+      finally {
+        wrapper.unmount()
+      }
+    }
+    finally {
+      removeCustomComponents(scopeId)
+    }
+  })
+
+  it('passes node props to custom components when using nodes prop with customHtmlTags', async () => {
+    const scopeId = 'custom-nodes-prop-thinking'
+    const ThinkingNode = defineComponent({
+      name: 'ThinkingNode',
+      props: {
+        node: { type: Object, default: () => ({ loading: false, content: '' }) },
+      },
+      setup(props) {
+        return () => h('div', { class: 'thinking-node' }, props.node.content)
+      },
+    })
+
+    setCustomComponents(scopeId, {
+      thinking: (props: any) => h(ThinkingNode, props),
+    })
+
+    try {
+      // Pre-parsed nodes as if parsed without customHtmlTags – the thinking
+      // tag is still an html_block with tag:"thinking".
+      const nodes = [
+        {
+          type: 'html_block',
+          tag: 'thinking',
+          content: '<thinking>I am thinking</thinking>',
+          raw: '<thinking>I am thinking</thinking>',
+          loading: false,
+        },
+        {
+          type: 'paragraph',
+          children: [{ type: 'text', content: 'Hello', raw: 'Hello' }],
+        },
+      ]
+
+      const wrapper = mount(MarkdownRender, {
+        props: {
+          nodes,
+          final: true,
+          customId: scopeId,
+          customHtmlTags: ['thinking'],
+        },
+      })
+      await flushAll()
+
+      try {
+        const text = normalizeText(wrapper.text())
+        expect(text).toContain('I am thinking')
+        expect(text).toContain('Hello')
+        // The custom component should be rendered (not the default HtmlBlockNode)
+        expect(wrapper.find('.thinking-node').exists()).toBe(true)
       }
       finally {
         wrapper.unmount()

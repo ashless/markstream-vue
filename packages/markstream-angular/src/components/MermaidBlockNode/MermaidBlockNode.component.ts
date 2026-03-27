@@ -1,19 +1,18 @@
+import type { AfterViewInit, ElementRef, OnChanges, OnDestroy } from '@angular/core'
+import type { AngularRenderableNode, AngularRenderContext } from '../shared/node-helpers'
 import { CommonModule } from '@angular/common'
-import type { AfterViewInit, OnChanges, OnDestroy } from '@angular/core'
 import {
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
-  ElementRef,
   HostListener,
+  inject,
   Input,
   ViewChild,
-  inject,
 } from '@angular/core'
 import { getMermaid } from '../../optional/mermaid'
 import { toSafeSvgMarkup } from '../../sanitizeSvg'
 import { canParseOffthread, findPrefixOffthread } from '../../workers/mermaidWorkerClient'
-import type { AngularRenderContext, AngularRenderableNode } from '../shared/node-helpers'
 import { getString } from '../shared/node-helpers'
 import {
   clampNumber,
@@ -482,6 +481,15 @@ export class MermaidBlockNodeComponent implements AfterViewInit, OnChanges, OnDe
     catch (error) {
       if (this.destroyed || token !== this.renderToken)
         return
+      // Allow consumer to handle the error via onRenderError callback
+      const onRenderError = this.mergedProps.onRenderError
+      if (typeof onRenderError === 'function' && this.previewHost?.nativeElement) {
+        const handled = onRenderError(error, this.code, this.previewHost.nativeElement)
+        if (handled === true) {
+          this.svgMarkup = ''
+          return
+        }
+      }
       this.svgMarkup = ''
       this.showSource = true
       this.error = error instanceof Error ? error.message : 'Failed to render Mermaid diagram.'

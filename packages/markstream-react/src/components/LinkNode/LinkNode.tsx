@@ -3,6 +3,7 @@ import type { NodeComponentProps } from '../../types/node-component'
 import React, { useCallback, useMemo } from 'react'
 import { renderNodeChildren } from '../../renderers/renderChildren'
 import { hideTooltip, showTooltipForAnchor } from '../../tooltip/singletonTooltip'
+import { TextNode } from '../TextNode/TextNode'
 
 export interface LinkNodeStyleProps {
   showTooltip?: boolean
@@ -31,13 +32,16 @@ export function LinkNode(props: NodeComponentProps<{
     const bottom = props.underlineBottom !== undefined
       ? (typeof props.underlineBottom === 'number' ? `${props.underlineBottom}px` : String(props.underlineBottom))
       : '-3px'
+    const activeOpacity = props.animationOpacity ?? 0.35
+    const restingOpacity = Math.max(0.12, Math.min(activeOpacity * 0.5, activeOpacity))
     return {
       ['--link-color' as any]: props.color ?? '#0366d6',
       ['--underline-height' as any]: `${props.underlineHeight ?? 2}px`,
       ['--underline-bottom' as any]: bottom,
-      ['--underline-opacity' as any]: String(props.animationOpacity ?? 0.9),
-      ['--underline-duration' as any]: `${props.animationDuration ?? 0.8}s`,
-      ['--underline-timing' as any]: props.animationTiming ?? 'linear',
+      ['--underline-opacity' as any]: String(activeOpacity),
+      ['--underline-rest-opacity' as any]: String(restingOpacity),
+      ['--underline-duration' as any]: `${props.animationDuration ?? 1.6}s`,
+      ['--underline-timing' as any]: props.animationTiming ?? 'ease-in-out',
       ['--underline-iteration' as any]: typeof props.animationIteration === 'number'
         ? String(props.animationIteration)
         : (props.animationIteration ?? 'infinite'),
@@ -79,9 +83,14 @@ export function LinkNode(props: NodeComponentProps<{
       >
         <span className="link-text-wrapper relative inline-flex">
           <span className="leading-[normal] link-text">
-            <span className="leading-[normal] link-text">{node.text ?? ''}</span>
+            <TextNode
+              node={{ type: 'text', content: String(node.text ?? '') }}
+              ctx={ctx}
+              indexKey={`${String(indexKey ?? 'link')}-loading`}
+              typewriter={props.typewriter}
+            />
           </span>
-          <span className="underline-anim" aria-hidden="true" />
+          <span className="link-loading-indicator" aria-hidden="true" />
         </span>
       </span>
     )
@@ -101,7 +110,14 @@ export function LinkNode(props: NodeComponentProps<{
     >
       {ctx && renderNode
         ? renderNodeChildren(node.children, ctx, String(indexKey ?? 'link'), renderNode)
-        : (node.text ?? null)}
+        : (
+            <TextNode
+              node={{ type: 'text', content: String(node.text ?? '') }}
+              ctx={ctx}
+              indexKey={`${String(indexKey ?? 'link')}-fallback`}
+              typewriter={props.typewriter}
+            />
+          )}
     </a>
   )
 }

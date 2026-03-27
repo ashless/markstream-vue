@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
+import type { MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
 import type { VisibilityHandle } from '../../composables/viewportPriority'
-import type { D2BlockNodeProps, InfographicBlockNodeProps, MermaidBlockNodeProps } from '../../types/component-props'
+import type { NodeRendererProps } from '../../types/node-renderer-props'
 import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
 import { computed, defineAsyncComponent, markRaw, nextTick, onBeforeUnmount, provide, reactive, ref, useAttrs, watch } from 'vue'
 import AdmonitionNode from '../../components/AdmonitionNode'
@@ -46,80 +46,6 @@ interface IdleDeadlineLike {
   timeRemaining?: () => number
 }
 
-// Exported props interface so declaration generators can include prop types
-export interface NodeRendererProps {
-  content?: string
-  nodes?: BaseNode[]
-  /**
-   * Whether the input stream is complete (end-of-stream). When true, the parser
-   * will stop emitting streaming "loading" nodes for unfinished constructs.
-   */
-  final?: boolean
-  /** Options forwarded to parseMarkdownToStructure when content is provided */
-  parseOptions?: ParseOptions
-  customMarkdownIt?: (md: MarkdownIt) => MarkdownIt
-  /** Log parse/render timing and virtualization stats (dev only) */
-  debugPerformance?: boolean
-  /**
-   * Custom HTML-like tags that participate in streaming mid‑state handling
-   * and are emitted as custom nodes (e.g. ['thinking']). Forwarded to `getMarkdown()`.
-   */
-  customHtmlTags?: readonly string[]
-  /** Enable priority rendering for visible viewport area */
-  viewportPriority?: boolean
-  /**
-   * Whether code_block renders should stream updates.
-   * When false, code blocks stay in a loading state and render once when final content is ready.
-   * Default: true
-   */
-  codeBlockStream?: boolean
-  // 全局传递到每个 CodeBlockNode 的主题（monaco theme 对象）
-  codeBlockDarkTheme?: any
-  codeBlockLightTheme?: any
-  // 传递给 CodeBlockNode 的 monacoOptions（比如 fontSize, MAX_HEIGHT 等）
-  codeBlockMonacoOptions?: Record<string, any>
-  /** If true, render all `code_block` nodes as plain <pre><code> blocks instead of the full CodeBlockNode */
-  renderCodeBlocksAsPre?: boolean
-  /** Minimum width forwarded to CodeBlockNode (px or CSS unit) */
-  codeBlockMinWidth?: string | number
-  /** Maximum width forwarded to CodeBlockNode (px or CSS unit) */
-  codeBlockMaxWidth?: string | number
-  /** Arbitrary props to forward to every CodeBlockNode */
-  codeBlockProps?: Record<string, any>
-  /** Props forwarded to MermaidBlockNode for mermaid fences */
-  mermaidProps?: Partial<Omit<MermaidBlockNodeProps, 'node' | 'loading' | 'isDark'>>
-  /** Props forwarded to D2BlockNode for d2/d2lang fences */
-  d2Props?: Partial<Omit<D2BlockNodeProps, 'node' | 'loading' | 'isDark'>>
-  /** Props forwarded to InfographicBlockNode for infographic fences */
-  infographicProps?: Partial<Omit<InfographicBlockNodeProps, 'node' | 'loading' | 'isDark'>>
-  /** Global tooltip toggle for link/code-block renderers (default: true) */
-  showTooltips?: boolean
-  themes?: string[]
-  isDark?: boolean
-  customId?: string
-  indexKey?: number | string
-  /** Enable/disable the non-code-node enter transition (typewriter). Default: true */
-  typewriter?: boolean
-  /** Enable incremental/batched rendering of nodes to avoid large single flush costs. Default: true */
-  batchRendering?: boolean
-  /** How many nodes to render immediately before batching kicks in. Default: 40 */
-  initialRenderBatchSize?: number
-  /** How many additional nodes to render per batch tick. Default: 80 */
-  renderBatchSize?: number
-  /** Extra delay (ms) before each batch after rAF; helps yield to input. Default: 16 */
-  renderBatchDelay?: number
-  /** Target budget (ms) for each batch before we shrink subsequent batch sizes. Default: 6 */
-  renderBatchBudgetMs?: number
-  /** Timeout (ms) for requestIdleCallback slices. Default: 120 */
-  renderBatchIdleTimeoutMs?: number
-  /** Defer rendering nodes until they are near the viewport */
-  deferNodesUntilVisible?: boolean
-  /** Maximum number of fully rendered nodes kept in DOM. Default: 320 */
-  maxLiveNodes?: number
-  /** Number of nodes to keep before/after focus. Default: 60 */
-  liveNodeBuffer?: number
-}
-
 const props = withDefaults(defineProps<NodeRendererProps>(), {
   codeBlockStream: true,
   showTooltips: true,
@@ -148,6 +74,8 @@ const SCROLL_PARENT_OVERFLOW_RE = /auto|scroll|overlay/i
 const isClient = typeof window !== 'undefined'
 const debugPerformanceEnabled = computed(() => props.debugPerformance && isClient && typeof console !== 'undefined')
 const attrs = useAttrs()
+const textStreamState = new Map<string, string>()
+const streamRenderVersion = ref(0)
 const resolvedShowTooltips = computed<boolean | undefined>(() => {
   if (typeof props.showTooltips === 'boolean')
     return props.showTooltips
@@ -159,11 +87,36 @@ const resolvedShowTooltips = computed<boolean | undefined>(() => {
   return undefined
 })
 provide('markstreamShowTooltips', resolvedShowTooltips)
+provide('markstreamTypewriter', computed(() => props.typewriter !== false))
+provide('markstreamTextStreamState', textStreamState)
+provide('markstreamStreamVersion', streamRenderVersion)
+
+watch(
+  [() => props.content, () => props.nodes],
+  () => {
+    streamRenderVersion.value += 1
+  },
+  { immediate: true },
+)
 
 function logPerf(label: string, data: Record<string, unknown>) {
   if (!debugPerformanceEnabled.value)
     return
   console.info(`[markstream-vue][perf] ${label}`, data)
+}
+
+function hasOverflowScrollStyle(style: CSSStyleDeclaration | null | undefined) {
+  if (!style)
+    return false
+  const overflowY = (style.overflowY || '').toLowerCase()
+  const overflow = (style.overflow || '').toLowerCase()
+  return SCROLL_PARENT_OVERFLOW_RE.test(overflowY) || SCROLL_PARENT_OVERFLOW_RE.test(overflow)
+}
+
+function isActuallyScrollableElement(element: HTMLElement) {
+  const verticalOverflow = Math.ceil(element.scrollHeight) > Math.ceil(element.clientHeight) + 1
+  const horizontalOverflow = Math.ceil(element.scrollWidth) > Math.ceil(element.clientWidth) + 1
+  return verticalOverflow || horizontalOverflow
 }
 
 function resolveViewportRoot(node?: HTMLElement | null) {
@@ -179,9 +132,7 @@ function resolveViewportRoot(node?: HTMLElement | null) {
     if (current === doc.body || current === rootScrollable)
       break
     const style = window.getComputedStyle(current)
-    const overflowY = (style.overflowY || '').toLowerCase()
-    const overflow = (style.overflow || '').toLowerCase()
-    if (SCROLL_PARENT_OVERFLOW_RE.test(overflowY) || SCROLL_PARENT_OVERFLOW_RE.test(overflow))
+    if (hasOverflowScrollStyle(style) && isActuallyScrollableElement(current))
       return current
     current = current.parentElement
   }
@@ -254,6 +205,14 @@ const mergedParseOptions = computed(() => {
     ...(hasFinal ? { final: resolvedFinal } : {}),
     ...(hasCustom ? { customHtmlTags: Array.from(new Set(merged)) } : {}),
   } as ParseOptions
+})
+
+// Set of effective custom HTML tags (normalised to lowercase).
+// Used in `renderedItems` to coerce pre-parsed html_block/html_inline nodes
+// whose tag matches a registered custom component.
+const effectiveCustomHtmlTagsSet = computed<Set<string>>(() => {
+  const arr: string[] = (mergedParseOptions.value as any).customHtmlTags ?? []
+  return new Set(arr.map(t => String(t).trim().toLowerCase()).filter(Boolean))
 })
 
 const parsedNodes = computed<ParsedNode[]>(() => {
@@ -330,8 +289,9 @@ const previousRenderContext = ref<{ key: typeof props.indexKey, total: number }>
   total: 0,
 })
 const adaptiveBatchSize = ref(Math.max(1, resolvedBatchSize.value || 1))
-const nodeVisibilityState = reactive<Record<number, boolean>>({})
+const visibleNodeIndices = ref<Set<number>>(new Set())
 const nodeVisibilityHandles = new Map<number, VisibilityHandle>()
+const nodeVisibilityWatchStops = new Map<number, () => void>()
 const nodeVisibilityFallbackTimers = new Map<number, number>()
 const nodeSlotElements = new Map<number, HTMLElement | null>()
 const codeBlockRenderCache = new WeakMap<object, { signature: string, node: ParsedNode }>()
@@ -833,6 +793,30 @@ function bumpNodeSlotVersion() {
   nodeSlotVersion.value += 1
 }
 
+function setNodeVisibleState(index: number, visible: boolean) {
+  const current = visibleNodeIndices.value
+  const hasIndex = current.has(index)
+  if (visible) {
+    if (hasIndex)
+      return
+    const next = new Set(current)
+    next.add(index)
+    visibleNodeIndices.value = next
+    return
+  }
+  if (!hasIndex)
+    return
+  const next = new Set(current)
+  next.delete(index)
+  visibleNodeIndices.value = next
+}
+
+function resetNodeVisibleState() {
+  if (visibleNodeIndices.value.size === 0)
+    return
+  visibleNodeIndices.value = new Set()
+}
+
 function cleanupNodeVisibility(maxIndex: number) {
   if (!nodeVisibilityHandles.size)
     return
@@ -846,7 +830,7 @@ function cleanupNodeVisibility(maxIndex: number) {
       handle.destroy()
       nodeVisibilityHandles.delete(index)
       if (deferNodes.value)
-        delete nodeVisibilityState[index]
+        setNodeVisibleState(index, false)
       clearVisibilityFallback(index)
       if (nodeSlotElements.delete(index))
         slotsChanged = true
@@ -858,7 +842,7 @@ function cleanupNodeVisibility(maxIndex: number) {
 
 function markNodeVisible(index: number, visible: boolean) {
   if (deferNodes.value)
-    nodeVisibilityState[index] = visible
+    setNodeVisibleState(index, visible)
   if (visible) {
     if (virtualizationEnabled.value)
       scheduleFocusSync()
@@ -876,10 +860,15 @@ function shouldRenderNode(index: number) {
     return true
   if (index < resolvedInitialBatch.value)
     return true
-  return nodeVisibilityState[index] === true
+  return visibleNodeIndices.value.has(index)
 }
 
 function destroyNodeHandle(index: number) {
+  const stopWatchingVisibility = nodeVisibilityWatchStops.get(index)
+  if (stopWatchingVisibility) {
+    stopWatchingVisibility()
+    nodeVisibilityWatchStops.delete(index)
+  }
   const handle = nodeVisibilityHandles.get(index)
   if (handle) {
     handle.destroy()
@@ -908,8 +897,6 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
     destroyNodeHandle(index)
     if (el)
       markNodeVisible(index, true)
-    else if (deferNodes.value)
-      delete nodeVisibilityState[index]
     return
   }
 
@@ -924,8 +911,6 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
       destroyNodeHandle(index)
       if (el)
         markNodeVisible(index, true)
-      else if (deferNodes.value)
-        delete nodeVisibilityState[index]
       return
     }
   }
@@ -936,10 +921,14 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
     return
   }
 
+  if (visibleNodeIndices.value.has(index)) {
+    destroyNodeHandle(index)
+    markNodeVisible(index, true)
+    return
+  }
+
   if (!el) {
     destroyNodeHandle(index)
-    if (deferNodes.value)
-      delete nodeVisibilityState[index]
     return
   }
 
@@ -951,13 +940,16 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
   markNodeVisible(index, handle.isVisible.value)
   if (deferNodes.value)
     scheduleVisibilityFallback(index)
-  handle.whenVisible
-    .then(() => {
+  let stopWatchingVisibility: (() => void) | null = null
+  stopWatchingVisibility = watch(
+    () => handle.isVisible.value,
+    (visible) => {
+      if (!visible)
+        return
       clearVisibilityFallback(index)
       markNodeVisible(index, true)
-    })
-    .catch(() => {})
-    .finally(() => {
+      stopWatchingVisibility?.()
+      nodeVisibilityWatchStops.delete(index)
       // Once visibility is confirmed we can release the handle reference so
       // long-lived renders (no virtualization) do not leak observers.
       if (nodeVisibilityHandles.get(index) === handle)
@@ -966,7 +958,10 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
         handle.destroy()
       }
       catch {}
-    })
+    },
+    { immediate: true },
+  )
+  nodeVisibilityWatchStops.set(index, stopWatchingVisibility)
 
   if (virtualizationEnabled.value)
     scheduleFocusSync()
@@ -1030,13 +1025,11 @@ function scheduleVisibilityFallback(index: number) {
     nodeVisibilityFallbackTimers.delete(index)
     if (!deferNodes.value)
       return
-    if (nodeVisibilityState[index] === true)
+    if (visibleNodeIndices.value.has(index))
       return
     const el = nodeSlotElements.get(index)
-    if (!el) {
-      delete nodeVisibilityState[index]
+    if (!el)
       return
-    }
 
     const root = resolveScrollContainer(el)
     const doc = el.ownerDocument || document
@@ -1075,8 +1068,7 @@ function autoDisableViewportPriority(reason: 'too-many-targets') {
       window.clearTimeout(timer)
   }
   nodeVisibilityFallbackTimers.clear()
-  for (const key of Object.keys(nodeVisibilityState))
-    delete nodeVisibilityState[key]
+  resetNodeVisibleState()
 }
 
 function scheduleBatch(increment: number, opts: { immediate?: boolean } = {}) {
@@ -1312,8 +1304,7 @@ watch(
       nodeVisibilityHandles.clear()
       for (const index of Array.from(nodeVisibilityFallbackTimers.keys()))
         clearVisibilityFallback(index)
-      for (const key of Object.keys(nodeVisibilityState))
-        delete nodeVisibilityState[key]
+      resetNodeVisibleState()
       for (const [index, el] of nodeSlotElements) {
         if (el)
           markNodeVisible(index, true)
@@ -1402,6 +1393,9 @@ onBeforeUnmount(() => {
   for (const handle of nodeVisibilityHandles.values())
     handle.destroy()
   nodeVisibilityHandles.clear()
+  for (const stopWatchingVisibility of nodeVisibilityWatchStops.values())
+    stopWatchingVisibility()
+  nodeVisibilityWatchStops.clear()
   for (const index of Array.from(nodeVisibilityFallbackTimers.keys()))
     clearVisibilityFallback(index)
   cleanupScrollListener()
@@ -1573,18 +1567,64 @@ const renderedItems = computed(() => {
   return visibleNodes.value.map((item) => {
     // Reuse the previous shallow clone for code blocks unless the visible
     // payload changed, so parent recomputations do not churn Monaco props.
-    const node = getCodeBlockRenderNode(item.node)
+    let node = getCodeBlockRenderNode(item.node)
     const language = getCodeBlockLanguage(node)
+    let component = getNodeComponent(node, language)
+
+    // When an html_block or html_inline node resolved to its default
+    // component, check whether the node's tag matches a registered custom
+    // component AND is listed in customHtmlTags.  This handles pre-parsed
+    // nodes (via the `nodes` prop) that were not parsed with
+    // `customHtmlTags`, so their type is still `html_block`/`html_inline`
+    // but the tag references a known custom component.
+    if (
+      (node.type === 'html_block' || node.type === 'html_inline')
+      && component === (nodeComponents as any)[node.type]
+    ) {
+      const tag = String((node as any).tag ?? '').trim().toLowerCase()
+        || getHtmlTagFromContent((node as any).content)
+      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
+        const customComponents = customComponentsMap.value
+        const customForTag = (customComponents as any)[tag]
+        if (customForTag) {
+          component = customForTag
+          node = {
+            ...(node as any),
+            type: tag,
+            tag,
+            content: stripCustomHtmlWrapper((node as any).content, tag),
+          } as ParsedNode
+        }
+      }
+    }
+
     return {
       ...item,
       node,
-      component: getNodeComponent(node, language),
+      component,
       bindings: getBindingsFor(node, language),
       isCodeBlock: node.type === 'code_block',
       indexKey: `${indexPrefix.value}-${item.index}`,
     }
   })
 })
+
+function getHtmlTagFromContent(html: unknown) {
+  const raw = String(html ?? '')
+  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
+  return match ? match[1].toLowerCase() : ''
+}
+
+function stripCustomHtmlWrapper(html: unknown, tag: string) {
+  const raw = String(html ?? '')
+  if (!tag)
+    return raw
+  // Escape special regex characters to prevent unexpected behavior.
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const openRe = new RegExp(String.raw`^\s*<\s*${escaped}(?:\s[^>]*)?>\s*`, 'i')
+  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${escaped}\s*>\s*$`, 'i')
+  return raw.replace(openRe, '').replace(closeRe, '')
+}
 
 function getCodeBlockLanguage(node: ParsedNode) {
   return node?.type === 'code_block'
