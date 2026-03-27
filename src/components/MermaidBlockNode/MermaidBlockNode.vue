@@ -37,10 +37,7 @@ const props = withDefaults(
     enableWheelZoom: false,
     isStrict: false,
     showTooltips: true,
-<<<<<<< HEAD
     headerBtnZIndex: 50
-=======
->>>>>>> upstream/main
   },
 )
 
