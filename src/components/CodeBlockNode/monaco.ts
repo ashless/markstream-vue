@@ -1,51 +1,106 @@
+import type { CodeBlockMonacoOptions, CodeBlockMonacoTheme } from '../../types/component-props'
 import { preload } from '../NodeRenderer/preloadMonaco'
 
-let mod: any = null
-let importAttempted = false
+export interface MonacoDisposableLike {
+  dispose?: () => void
+}
 
-async function warmupShikiTokenizer(m: any) {
-  const getOrCreateHighlighter = m?.getOrCreateHighlighter
-  if (typeof getOrCreateHighlighter !== 'function')
-    return true
+export interface MonacoModelLike {
+  getLineCount?: () => number
+}
 
-  try {
-    const highlighter = await getOrCreateHighlighter(
-      ['vitesse-dark', 'vitesse-light'],
-      ['plaintext', 'text', 'javascript'],
-    )
+export interface MonacoEditorViewLike {
+  getModel?: () => MonacoModelLike | null | undefined
+  getOption?: (option: unknown) => unknown
+  updateOptions?: (options: Record<string, unknown>) => void
+  layout?: () => void
+  getContentHeight?: () => number
+  onDidContentSizeChange?: (listener: () => void) => MonacoDisposableLike | void
+  onDidLayoutChange?: (listener: () => void) => MonacoDisposableLike | void
+}
 
-    if (highlighter && typeof highlighter.codeToTokens === 'function') {
-      highlighter.codeToTokens('const a = 1', { lang: 'javascript', theme: 'vitesse-dark' })
-    }
-    return true
-  }
-  catch (err) {
-    console.warn('[markstream-vue] Failed to warm up Shiki tokenizer; disabling stream-monaco for this session.', err)
-    return false
+export interface MonacoDiffLineChangeLike {
+  originalStartLineNumber?: number
+  originalEndLineNumber?: number
+  modifiedStartLineNumber?: number
+  modifiedEndLineNumber?: number
+}
+
+export interface MonacoDiffEditorViewLike extends MonacoEditorViewLike {
+  getOriginalEditor?: () => MonacoEditorViewLike | null | undefined
+  getModifiedEditor?: () => MonacoEditorViewLike | null | undefined
+  getLineChanges?: () => MonacoDiffLineChangeLike[] | null | undefined
+  onDidUpdateDiff?: (listener: () => void) => MonacoDisposableLike | void
+}
+
+export interface MonacoNamespaceLike {
+  EditorOption?: {
+    fontInfo?: unknown
+    lineHeight?: unknown
   }
 }
 
-export async function getUseMonaco() {
-  if (mod)
-    return mod
-  if (importAttempted)
-    return null
+export interface MonacoRuntimeOptions extends Omit<CodeBlockMonacoOptions, 'theme'> {
+  theme?: CodeBlockMonacoTheme
+  themes?: CodeBlockMonacoTheme[]
+  onThemeChange?: () => void
+}
 
-  try {
-    mod = await import('stream-monaco')
-    await preload(mod)
-    const ok = await warmupShikiTokenizer(mod)
-    if (!ok) {
-      mod = null
-      importAttempted = true
+export interface MonacoHelpers {
+  createEditor?: (container: HTMLElement, code: string, language: string) => Promise<unknown> | unknown
+  createDiffEditor?: (container: HTMLElement, original: string, modified: string, language: string) => Promise<unknown> | unknown
+  updateCode?: (code: string, language: string) => Promise<unknown> | unknown
+  updateDiff?: (original: string, modified: string, language: string) => Promise<unknown> | unknown
+  getEditor?: () => MonacoNamespaceLike | null
+  getEditorView?: () => MonacoEditorViewLike | null
+  getDiffEditorView?: () => MonacoDiffEditorViewLike | null
+  cleanupEditor?: () => void
+  safeClean?: () => void
+  refreshDiffPresentation?: () => void
+  setTheme?: (theme: CodeBlockMonacoTheme | undefined) => Promise<void> | void
+}
+
+export interface MonacoModule {
+  useMonaco?: (options: MonacoRuntimeOptions) => MonacoHelpers | null | undefined
+  detectLanguage?: (code: string) => string
+  preloadMonacoWorkers?: () => Promise<unknown> | unknown
+}
+
+let mod: MonacoModule | null = null
+let importFailed = false
+let loadingPromise: Promise<MonacoModule | null> | null = null
+
+export async function getUseMonaco(): Promise<MonacoModule | null> {
+  if (loadingPromise)
+    return loadingPromise
+
+  loadingPromise = (async () => {
+    if (!mod) {
+      if (importFailed)
+        return null
+      try {
+        mod = await import('stream-monaco') as MonacoModule
+      }
+      catch {
+        importFailed = true
+        return null
+      }
+    }
+
+    try {
+      await preload(mod)
+      return mod
+    }
+    catch {
+      // Keep the imported module cached so temporary preload failures can retry.
       return null
     }
-    return mod
+  })()
+
+  try {
+    return await loadingPromise
   }
-  catch {
-    importAttempted = true
-    // Return null to indicate the module is not available
-    // The caller should handle the fallback gracefully
-    return null
+  finally {
+    loadingPromise = null
   }
 }

@@ -36,12 +36,14 @@ export type { MathOptions } from './config'
 export type { MarkdownIt }
 
 // Re-export utilities
+export * from './customHtmlTags'
 export { findMatchingClose } from './findMatchingClose'
-
+export * from './htmlRenderUtils'
+export * from './htmlTags'
 export { parseFenceToken } from './parser/inline-parsers/fence-parser'
+
 // Re-export plugins
 export { applyContainers } from './plugins/containers'
-
 export { ESCAPED_TEX_BRACE_COMMANDS, isMathLike, TEX_BRACE_COMMANDS } from './plugins/isMathLike'
 export { applyMath, KATEX_COMMANDS, normalizeStandaloneBackslashT } from './plugins/math'
 // Re-export the node types for backward compatibility
@@ -176,7 +178,7 @@ export function getMarkdown(msgId: string = `editor-${Date.now()}`, options: Get
   })
 
   // wave rule (legacy)
-  const waveRule = (state: unknown, silent: boolean) => {
+  const waveRule = (state: unknown, silent?: boolean) => {
     const s = state as unknown as { pos: number, src: string, push: (type: string, tag?: string, nesting?: number) => any }
     const start = s.pos
     if (s.src[start] !== '~')
@@ -242,7 +244,7 @@ export function getMarkdown(msgId: string = `editor-${Date.now()}`, options: Get
     // CommonMark reference-style links.
     return !/^\d+$/.test(nextLabel)
   }
-  const referenceInline = (state: unknown, silent: boolean) => {
+  const referenceInline = (state: unknown, silent?: boolean) => {
     const s = state as unknown as { src: string, pos: number, push: (type: string, tag?: string, nesting?: number) => any }
     if (s.src[s.pos] !== '[')
       return false
@@ -265,6 +267,7 @@ export function getMarkdown(msgId: string = `editor-${Date.now()}`, options: Get
       const token = s.push('reference', 'span', 0)
       token.content = id
       token.markup = match[0]
+      token.raw = match[0]
     }
     s.pos += match[0].length
     return true

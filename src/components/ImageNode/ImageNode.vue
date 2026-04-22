@@ -1,17 +1,13 @@
 <script setup lang="ts">
 // 定义图片节点类型
 import type { ImageNodeProps } from '../../types/component-props'
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useSafeI18n } from '../../composables/useSafeI18n'
 
-import { useViewportPriority } from '../../composables/viewportPriority'
-
-// 接收props：node 是必须，其他为可选配置（fallback、是否显示caption、是否启用lazy）
+// 接收 props：node 是必须，其他为可选配置（fallback、是否启用 lazy）
 const props = withDefaults(defineProps<ImageNodeProps>(), {
   fallbackSrc: '',
-  showCaption: false,
-  lazy: true,
-  svgMinHeight: '12rem',
+  lazy: false,
   usePlaceholder: true,
 })
 
@@ -22,53 +18,16 @@ const emit = defineEmits<{ (e: 'load', src: string): void, (e: 'error', src: str
 const imageLoaded = ref(false)
 const hasError = ref(false)
 const fallbackTried = ref(false)
-const figureRef = ref<HTMLElement | null>(null)
-const registerVisibility = useViewportPriority()
-const visibilityHandle = ref<ReturnType<typeof registerVisibility> | null>(null)
-const isVisible = ref(typeof window === 'undefined')
-const visibilityReady = ref(typeof window === 'undefined')
-
-if (typeof window !== 'undefined') {
-  watch(
-    () => figureRef.value,
-    (el) => {
-      visibilityHandle.value?.destroy()
-      visibilityHandle.value = null
-      if (!el) {
-        isVisible.value = false
-        visibilityReady.value = false
-        return
-      }
-      const handle = registerVisibility(el, { rootMargin: '400px' })
-      visibilityHandle.value = handle
-      isVisible.value = handle.isVisible.value
-      visibilityReady.value = true
-      handle.whenVisible.then(() => {
-        isVisible.value = true
-      })
-    },
-    { immediate: true },
-  )
-}
-
-onBeforeUnmount(() => {
-  visibilityHandle.value?.destroy()
-  visibilityHandle.value = null
-})
 
 // 计算当前用于渲染的 src（当有 error 且提供 fallback 时使用 fallback）
 const displaySrc = computed(() => hasError.value && props.fallbackSrc ? props.fallbackSrc : props.node.src)
-const canRenderImage = computed(() => !props.lazy || isVisible.value || !visibilityReady.value)
-
-// 是否为 svg 文件（可能没有内置尺寸）
-const isSvg = computed(() => /\.svg(?:\?|$)/i.test(displaySrc.value))
+const useEagerImagePath = computed(() => !props.lazy)
 
 // 处理图片加载错误：尝试一次 fallback，否则保留错误状态
 function handleImageError() {
   if (props.fallbackSrc && !fallbackTried.value) {
     fallbackTried.value = true
     hasError.value = true
-    // leave imageLoaded false so placeholder/spinner can show while fallback loads
   }
   else {
     hasError.value = true
@@ -85,9 +44,7 @@ function handleImageLoad() {
 
 // 当用户点击/触摸图片时（仅对已成功加载的图片有效），向外发出 click 事件（用于图片 preview）
 function handleClick(e: Event) {
-  // stop propagation so parent click handlers don't see both pointerup and click
   e.preventDefault()
-
   if (!imageLoaded.value || hasError.value)
     return
   emit('click', [e, displaySrc.value])
@@ -103,86 +60,154 @@ watch(displaySrc, () => {
 </script>
 
 <template>
-  <figure ref="figureRef" class="text-center my-8">
-    <div class="relative inline-block">
-      <!-- 包裹条件渲染元素，启用 out-in 模式以在替换时做平滑过渡 -->
-      <transition name="img-switch" mode="out-in">
-        <!-- 图片展示区域：当有错误且没有 fallback 时显示占位符 -->
-        <img
-          v-if="!node.loading && !hasError && canRenderImage"
-          key="image"
-          :src="displaySrc"
-          :alt="String(props.node.alt ?? props.node.title ?? '')"
-          :title="String(props.node.title ?? props.node.alt ?? '')"
-          class="max-w-96 h-auto rounded-lg transition-opacity duration-200 ease-in-out"
-          :style="isSvg ? { minHeight: props.svgMinHeight, width: '100%', height: 'auto', objectFit: 'contain' } : undefined"
-          :class="{ 'opacity-0': !imageLoaded, 'opacity-100': imageLoaded, 'cursor-pointer': imageLoaded }"
-          :loading="props.lazy ? 'lazy' : 'eager'"
-          decoding="async"
-          :tabindex="imageLoaded ? 0 : -1"
-          :aria-label="props.node.alt ?? t('image.preview')"
-          @error="handleImageError"
-          @load="handleImageLoad"
-          @click="handleClick"
-        >
+  <span class="image-node-container">
+    <transition name="img-switch" mode="out-in">
+      <!-- Loaded image -->
+      <img
+        v-if="!node.loading && !hasError"
+        key="image"
+        :src="displaySrc"
+        :alt="String(props.node.alt ?? props.node.title ?? '')"
+        :title="String(props.node.title ?? props.node.alt ?? '')"
+        class="image-node__img"
+        :class="{
+          'is-loading': !useEagerImagePath && !imageLoaded,
+          'is-loaded': useEagerImagePath || imageLoaded,
+          'cursor-pointer': imageLoaded,
+        }"
+        :loading="props.lazy ? 'lazy' : undefined"
+        :fetchpriority="useEagerImagePath ? 'high' : undefined"
+        :decoding="useEagerImagePath ? 'sync' : 'async'"
+        :tabindex="imageLoaded ? 0 : -1"
+        :aria-label="props.node.alt ?? t('image.preview')"
+        @error="handleImageError"
+        @load="handleImageLoad"
+        @click="handleClick"
+      >
 
-        <!-- 加载时的简单占位/骨架；允许通过 usePlaceholder 关闭占位展示，改为纯文本 -->
-        <div
-          v-else-if="!hasError"
-          key="placeholder"
-          class="placeholder-layer max-w-96 inline-flex items-center justify-center gap-2"
-          :style="isSvg ? { minHeight: props.svgMinHeight, width: '100%' } : { minHeight: '6rem' }"
-        >
-          <template v-if="props.usePlaceholder">
-            <slot name="placeholder" :node="props.node" :display-src="displaySrc" :image-loaded="imageLoaded" :has-error="hasError" :fallback-src="props.fallbackSrc" :lazy="props.lazy" :is-svg="isSvg">
-              <div class="w-4 h-4 rounded-full border-2 border-solid border-current border-t-transparent animate-spin" aria-hidden="true" />
-              <span class="text-sm whitespace-nowrap">{{ t('image.loading') }}</span>
-            </slot>
-          </template>
-          <template v-else>
-            <!-- 如果禁用占位符，展示一行可替换的文本（slot 仍可被 error slot 覆盖） -->
-            <span class="text-sm text-gray-500">{{ node.raw }}</span>
-          </template>
-        </div>
-
-        <!-- 无法加载且没有提供 fallback 的错误占位 -->
-        <div v-else-if="!node.loading && !props.fallbackSrc" key="error" class="px-4 py-2 bg-gray-100 flex items-center justify-center rounded-lg gap-2 text-red-500">
-          <slot name="error" :node="props.node" :display-src="displaySrc" :image-loaded="imageLoaded" :has-error="hasError" :fallback-src="props.fallbackSrc" :lazy="props.lazy" :is-svg="isSvg">
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><!-- Icon from TDesign Icons by TDesign - https://github.com/Tencent/tdesign-icons/blob/main/LICENSE --><path fill="currentColor" d="M2 2h20v10h-2V4H4v9.586l5-5L14.414 14L13 15.414l-4-4l-5 5V20h8v2H2zm13.547 5a1 1 0 1 0 0 2a1 1 0 0 0 0-2m-3 1a3 3 0 1 1 6 0a3 3 0 0 1-6 0m3.625 6.757L19 17.586l2.828-2.829l1.415 1.415L20.414 19l2.829 2.828l-1.415 1.415L19 20.414l-2.828 2.829l-1.415-1.415L17.586 19l-2.829-2.828z" /></svg>
-            <span class="text-sm whitespace-nowrap">{{ t('image.loadError') }}</span>
+      <!-- Loading placeholder — shimmer skeleton -->
+      <span
+        v-else-if="!hasError"
+        key="placeholder"
+        class="image-placeholder"
+      >
+        <template v-if="props.usePlaceholder">
+          <slot name="placeholder" :node="props.node" :display-src="displaySrc" :image-loaded="imageLoaded" :has-error="hasError" :fallback-src="props.fallbackSrc" :lazy="props.lazy">
+            <span class="image-shimmer" />
           </slot>
-        </div>
-      </transition>
-    </div>
+        </template>
+        <template v-else>
+          <span class="image-node__raw-text">{{ node.raw }}</span>
+        </template>
+      </span>
 
-    <figcaption v-if="props.showCaption && props.node.alt" class="mt-2 text-sm text-gray-500 italic">
-      {{ props.node.alt }}
-    </figcaption>
-  </figure>
+      <!-- Error state -->
+      <span v-else-if="!node.loading && !props.fallbackSrc" key="error" class="image-error">
+        <slot name="error" :node="props.node" :display-src="displaySrc" :image-loaded="imageLoaded" :has-error="hasError" :fallback-src="props.fallbackSrc" :lazy="props.lazy">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><path fill="currentColor" d="M2 2h20v10h-2V4H4v9.586l5-5L14.414 14L13 15.414l-4-4l-5 5V20h8v2H2zm13.547 5a1 1 0 1 0 0 2a1 1 0 0 0 0-2m-3 1a3 3 0 1 1 6 0a3 3 0 0 1-6 0m3.625 6.757L19 17.586l2.828-2.829l1.415 1.415L20.414 19l2.829 2.828l-1.415 1.415L19 20.414l-2.828 2.829l-1.415-1.415L17.586 19l-2.829-2.828z" /></svg>
+          <span>{{ t('image.loadError') }}</span>
+        </slot>
+      </span>
+    </transition>
+  </span>
 </template>
 
 <style scoped>
-/* Transition between placeholder and image: fade + slight upward motion */
+/* ── Container ── */
+.image-node-container {
+  display: inline-block;
+  vertical-align: middle;
+  max-width: var(--ms-size-image-max-width);
+}
+
+/* ── Image ── */
+.image-node__img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+  transition: opacity var(--ms-duration-emphasis) var(--ms-ease-standard);
+}
+
+.image-node__img.is-loading {
+  opacity: 0;
+}
+
+.image-node__img.is-loaded {
+  opacity: 1;
+}
+
+/* ── Placeholder — shimmer skeleton ── */
+.image-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 8rem;
+  max-width: var(--ms-size-image-max-width);
+  background: hsl(var(--ms-muted));
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.image-shimmer {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 8rem;
+  background: linear-gradient(
+    90deg,
+    hsl(var(--ms-muted)) 0%,
+    hsl(var(--ms-muted-foreground) / 0.06) 50%,
+    hsl(var(--ms-muted)) 100%
+  );
+  background-size: 200% 100%;
+  animation: image-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes image-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* ── Error ── */
+.image-error {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1rem 1.5rem;
+  min-height: 4rem;
+  max-width: var(--ms-size-image-max-width);
+  background: hsl(var(--ms-muted));
+  color: hsl(var(--ms-muted-foreground));
+  font-size: var(--ms-text-label);
+  vertical-align: middle;
+}
+
+/* ── Raw text fallback ── */
+.image-node__raw-text {
+  font-size: var(--ms-text-label);
+  color: hsl(var(--ms-muted-foreground));
+}
+
+/* ── Transition ── */
 .img-switch-enter-active, .img-switch-leave-active {
-  transition: opacity 220ms ease, transform 220ms ease;
+  transition: opacity var(--ms-duration-emphasis) var(--ms-ease-standard),
+              transform var(--ms-duration-emphasis) var(--ms-ease-standard);
 }
 .img-switch-enter-from, .img-switch-leave-to {
   opacity: 0;
-  transform: translateY(6px);
+  transform: translateY(4px);
 }
 .img-switch-enter-to, .img-switch-leave-from {
   opacity: 1;
   transform: translateY(0);
 }
 
-/* Spinner styles using CSS animations to leverage compositor */
-.placeholder-layer {
-  will-change: transform, opacity;
-}
-
-/* Respect user preference for reduced motion */
+/* ── Reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
-  .spinner { animation: none !important; }
+  .image-shimmer { animation: none !important; }
   .img-switch-enter-active, .img-switch-leave-active { transition: none !important; }
 }
 </style>

@@ -3,11 +3,9 @@ import type { ParsedNode } from 'stream-markdown-parser'
 import type { RenderContext, RenderNodeFn } from '../types'
 
 export const BLOCK_LEVEL_TYPES = new Set([
-  'image',
   'table',
   'code_block',
   'html_block',
-  'html_inline',
   'blockquote',
   'list',
   'list_item',

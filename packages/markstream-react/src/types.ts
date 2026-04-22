@@ -3,10 +3,13 @@ import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-mark
 import type {
   CodeBlockMonacoOptions,
   CodeBlockMonacoTheme,
+  CodeBlockNodeProps,
   D2BlockNodeProps,
   InfographicBlockNodeProps,
   MermaidBlockNodeProps,
 } from './types/component-props'
+
+export type NodeRendererCodeBlockProps = Partial<Omit<CodeBlockNodeProps, 'node'>> & Record<string, unknown>
 
 export interface NodeRendererProps {
   content?: string
@@ -33,7 +36,7 @@ export interface NodeRendererProps {
   renderCodeBlocksAsPre?: boolean
   codeBlockMinWidth?: string | number
   codeBlockMaxWidth?: string | number
-  codeBlockProps?: Record<string, any>
+  codeBlockProps?: NodeRendererCodeBlockProps
   mermaidProps?: Partial<Omit<MermaidBlockNodeProps, 'node' | 'loading' | 'isDark'>>
   d2Props?: Partial<Omit<D2BlockNodeProps, 'node' | 'loading' | 'isDark'>>
   infographicProps?: Partial<Omit<InfographicBlockNodeProps, 'node' | 'loading' | 'isDark'>>
@@ -67,7 +70,8 @@ export interface RenderContext {
   textStreamState?: Map<string, string>
   streamRenderVersion?: number
   customComponents?: Record<string, React.ComponentType<any>>
-  codeBlockProps?: Record<string, any>
+  customHtmlTags?: readonly string[]
+  codeBlockProps?: NodeRendererCodeBlockProps
   mermaidProps?: Partial<Omit<MermaidBlockNodeProps, 'node' | 'loading' | 'isDark'>>
   d2Props?: Partial<Omit<D2BlockNodeProps, 'node' | 'loading' | 'isDark'>>
   infographicProps?: Partial<Omit<InfographicBlockNodeProps, 'node' | 'loading' | 'isDark'>>

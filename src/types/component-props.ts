@@ -22,6 +22,14 @@ export interface CodeBlockMonacoThemeObject {
 export type CodeBlockMonacoTheme = string | CodeBlockMonacoThemeObject;
 
 /**
+ * Unified theme prop for code blocks.
+ *
+ * - `string` or `CodeBlockMonacoThemeObject`: fixed theme, ignores page dark/light
+ * - `{ light, dark }`: auto-switches based on page isDark
+ */
+export type CodeBlockThemeProp = CodeBlockMonacoTheme | { light: CodeBlockMonacoTheme, dark: CodeBlockMonacoTheme }
+
+/**
  * Common language entry accepted by `stream-monaco`.
  *
  * The runtime also supports advanced lazy-loader signatures; keep the union
@@ -131,7 +139,9 @@ export interface CodeBlockMonacoOptions {
    */
   languages?: CodeBlockMonacoLanguage[];
   /** Render diff editors side-by-side instead of inline. */
-  renderSideBySide?: boolean;
+  renderSideBySide?: boolean
+  /** Allow Monaco to fall back to inline diff mode when the editor is narrow. */
+  useInlineViewWhenSpaceIsLimited?: boolean
   /** Allow resizing the split handle in side-by-side diff mode. */
   enableSplitViewResizing?: boolean;
   /** Keep whitespace-only changes visible in Monaco diff editors. */
@@ -180,15 +190,22 @@ export interface CodeBlockMonacoOptions {
 }
 
 export interface CodeBlockNodeProps {
-  node: CodeBlockNode;
-  isDark?: boolean;
-  loading?: boolean;
-  stream?: boolean;
-  /** Preferred dark Monaco theme for this code block instance. */
-  darkTheme?: CodeBlockMonacoTheme;
-  /** Preferred light Monaco theme for this code block instance. */
-  lightTheme?: CodeBlockMonacoTheme;
-  isShowPreview?: boolean;
+  node: CodeBlockNode
+  isDark?: boolean
+  loading?: boolean
+  stream?: boolean
+  /**
+   * Unified theme configuration.
+   * - `string` or theme object: fixed theme, ignores page dark/light switch
+   * - `{ light, dark }`: auto-switches based on `isDark`
+   * - When omitted, falls back to `darkTheme`/`lightTheme` props
+   */
+  theme?: CodeBlockThemeProp
+  /** @deprecated Use `theme` prop instead. Kept for backward compatibility. */
+  darkTheme?: CodeBlockMonacoTheme
+  /** @deprecated Use `theme` prop instead. Kept for backward compatibility. */
+  lightTheme?: CodeBlockMonacoTheme
+  isShowPreview?: boolean
   /** Monaco editor and diff behavior forwarded to `stream-monaco`. */
   monacoOptions?: CodeBlockMonacoOptions;
   enableFontSizeControl?: boolean;
@@ -209,18 +226,16 @@ export interface CodeBlockNodeProps {
 
 export interface ImageNodeProps {
   node: {
-    type: "image";
-    src: string;
-    alt: string;
-    title: string | null;
-    raw: string;
-    loading?: boolean;
-  };
-  fallbackSrc?: string;
-  showCaption?: boolean;
-  lazy?: boolean;
-  svgMinHeight?: string;
-  usePlaceholder?: boolean;
+    type: 'image'
+    src: string
+    alt: string
+    title: string | null
+    raw: string
+    loading?: boolean
+  }
+  fallbackSrc?: string
+  lazy?: boolean
+  usePlaceholder?: boolean
 }
 
 export interface LinkNodeProps {

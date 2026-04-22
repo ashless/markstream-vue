@@ -16,41 +16,24 @@ import type {
 } from '../types/component-props'
 import type { NodeComponentProps } from '../types/node-component'
 import React from 'react'
-import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
+import {
+  getMarkdown,
+  mergeCustomHtmlTags,
+  NON_STRUCTURING_HTML_TAGS,
+  parseMarkdownToStructure,
+  sanitizeHtmlTokenAttrs,
+  shouldRenderUnknownHtmlTagAsText,
+  stripCustomHtmlWrapper,
+} from 'stream-markdown-parser'
 import { getCustomNodeComponents } from '../customComponents'
 import { BLOCK_LEVEL_TYPES, renderInline, renderNodeChildren, tokenAttrsToProps } from '../renderers/renderChildren'
+import { isParagraphBreakingCustomHtmlNode, resolveCustomHtmlTag } from '../utils/customHtmlTag'
+import { normalizeDomAttrs } from '../utils/htmlToReact'
 import { normalizeLanguageIdentifier } from '../utils/languageIcon'
 import { parseHtmlToReactNodes } from './html'
 import { renderKatexToHtml } from './katex'
 
 const fallbackMarkdown = getMarkdown()
-
-function normalizeCustomTag(value: unknown) {
-  const raw = String(value ?? '').trim()
-  if (!raw)
-    return ''
-  const match = raw.match(/^[<\s/]*([A-Z][\w-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-function isHtmlLikeTagName(tag: string) {
-  return /^[a-z][a-z0-9-]*$/.test(tag)
-}
-
-function getHtmlTagFromContent(html: unknown) {
-  const raw = String(html ?? '')
-  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-function stripCustomHtmlWrapper(html: unknown, tag: string) {
-  const raw = String(html ?? '')
-  if (!tag)
-    return raw
-  const openRe = new RegExp(String.raw`^\s*<\s*${tag}(?:\s[^>]*)?>\s*`, 'i')
-  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${tag}\s*>\s*$`, 'i')
-  return raw.replace(openRe, '').replace(closeRe, '')
-}
 
 function formatLanguageLabel(language: unknown) {
   const normalized = normalizeLanguageIdentifier(String(language ?? ''))
@@ -104,14 +87,24 @@ function renderStaticCodeShell(
   )
 }
 
+function mergeHtmlBlockWrapperProps(attrs?: [string, string | null][] | null) {
+  const normalized = normalizeDomAttrs((tokenAttrsToProps(sanitizeHtmlTokenAttrs(attrs ?? undefined)) as Record<string, string> | undefined) || {})
+  const next = { ...normalized }
+  const existing = typeof next.className === 'string' ? next.className.trim() : ''
+  next.className = existing ? `html-block-node ${existing}` : 'html-block-node'
+  return next
+}
+
 function createRenderContext(
   props: NodeRendererProps,
   customComponents: Record<string, React.ComponentType<any>>,
   indexPrefix: string,
+  customHtmlTags: readonly string[],
 ): RenderContext {
   return {
     customId: props.customId,
     customComponents,
+    customHtmlTags,
     isDark: props.isDark,
     indexKey: indexPrefix,
     typewriter: props.typewriter,
@@ -244,6 +237,62 @@ export function TextNode(props: NodeComponentProps<{ type: 'text', content: stri
   )
 }
 
+function isWhitespaceTextNode(node: ParsedNode | null | undefined) {
+  return node?.type === 'text' && String((node as any)?.content ?? '').trim() === ''
+}
+
+function getMeaningfulLinkChildren(node: ParsedNode | null | undefined) {
+  if (node?.type !== 'link' || !Array.isArray((node as any)?.children))
+    return []
+
+  return ((node as any).children as ParsedNode[]).filter(child => !isWhitespaceTextNode(child))
+}
+
+function isImageOnlyLinkNode(node: ParsedNode | null | undefined) {
+  const linkChildren = getMeaningfulLinkChildren(node)
+  return linkChildren.length === 1 && linkChildren[0]?.type === 'image'
+}
+
+function renderParagraphInlineNodes(
+  nodes: ParsedNode[],
+  renderNode: NonNullable<NodeComponentProps<{ type: 'paragraph', children?: ParsedNode[] }>['renderNode']>,
+  ctx: NonNullable<NodeComponentProps<{ type: 'paragraph', children?: ParsedNode[] }>['ctx']>,
+  prefix: string,
+) {
+  const meaningfulChildren = nodes.filter(child => !isWhitespaceTextNode(child))
+  const mediaOnly = meaningfulChildren.length > 0
+    && meaningfulChildren.every(child => child.type === 'image' || isImageOnlyLinkNode(child))
+
+  if (!mediaOnly || meaningfulChildren.length <= 1)
+    return renderNodeChildren(nodes, ctx, prefix, renderNode)
+
+  const normalizedNodes: ParsedNode[] = []
+  for (let index = 0; index < nodes.length; index++) {
+    const child = nodes[index]
+    if (!isWhitespaceTextNode(child)) {
+      normalizedNodes.push(child)
+      continue
+    }
+
+    const hasPrevious = normalizedNodes.length > 0
+    const hasNext = nodes.slice(index + 1).some(nextChild => !isWhitespaceTextNode(nextChild))
+    if (!hasPrevious || !hasNext)
+      continue
+
+    normalizedNodes.push({
+      ...(child as any),
+      content: ' ',
+      raw: ' ',
+    })
+  }
+
+  return normalizedNodes.map((child, index) => (
+    mediaOnly && isWhitespaceTextNode(child)
+      ? <React.Fragment key={`${prefix}-${index}`}>{String((child as any)?.content ?? '')}</React.Fragment>
+      : renderNode(child, `${prefix}-${index}`, ctx)
+  ))
+}
+
 export function ParagraphNode(props: NodeComponentProps<{ type: 'paragraph', children?: ParsedNode[] }>) {
   const { node, ctx, renderNode: renderNodeProp, indexKey, children } = props
   if (!ctx || !renderNodeProp) {
@@ -255,6 +304,7 @@ export function ParagraphNode(props: NodeComponentProps<{ type: 'paragraph', chi
   }
 
   const nodeChildren = node.children ?? []
+  const customComponents = ctx.customComponents ?? getCustomNodeComponents(ctx.customId)
   const parts: React.ReactNode[] = []
   const inlineBuffer: ParsedNode[] = []
 
@@ -264,14 +314,14 @@ export function ParagraphNode(props: NodeComponentProps<{ type: 'paragraph', chi
     const chunkIndex = parts.length
     parts.push(
       <p key={`${String(indexKey ?? 'paragraph')}-inline-${chunkIndex}`} dir="auto" className="paragraph-node">
-        {renderNodeChildren(inlineBuffer.slice(), ctx, `${String(indexKey ?? 'paragraph')}-${chunkIndex}`, renderNodeProp)}
+        {renderParagraphInlineNodes(inlineBuffer.slice(), renderNodeProp, ctx, `${String(indexKey ?? 'paragraph')}-${chunkIndex}`)}
       </p>,
     )
     inlineBuffer.length = 0
   }
 
   nodeChildren.forEach((child, childIndex) => {
-    if (BLOCK_LEVEL_TYPES.has(child.type)) {
+    if (BLOCK_LEVEL_TYPES.has(child.type) || isParagraphBreakingCustomHtmlNode(child, customComponents, ctx.customHtmlTags)) {
       flushInline()
       parts.push(
         <React.Fragment key={`${String(indexKey ?? 'paragraph')}-block-${childIndex}`}>
@@ -288,7 +338,7 @@ export function ParagraphNode(props: NodeComponentProps<{ type: 'paragraph', chi
   if (!parts.length) {
     return (
       <p dir="auto" className="paragraph-node">
-        {renderNodeChildren(nodeChildren, ctx, String(indexKey ?? 'paragraph'), renderNodeProp)}
+        {renderParagraphInlineNodes(nodeChildren, renderNodeProp, ctx, String(indexKey ?? 'paragraph'))}
       </p>
     )
   }
@@ -701,33 +751,18 @@ export function LinkNode(props: NodeComponentProps<LinkNodeProps['node']> & {
 }
 
 export function ImageNode(rawProps: ImageNodeProps) {
-  const props = {
-    showCaption: false,
-    ...rawProps,
-  }
+  const props = rawProps
   return (
-    <figure className="image-node">
-      <div className="image-node__inner">
-        <img
-          src={props.node.src}
-          alt={String(props.node.alt ?? props.node.title ?? '')}
-          title={String(props.node.title ?? props.node.alt ?? '')}
-          className="image-node__img is-loaded"
-          style={/\.svg(?:\?|$)/i.test(String(props.node.src))
-            ? { minHeight: props.svgMinHeight ?? '12rem', width: '100%', height: 'auto', objectFit: 'contain' }
-            : undefined}
-          loading={props.lazy === false ? 'eager' : 'lazy'}
-          decoding="async"
-          tabIndex={0}
-          aria-label={props.node.alt ?? 'Preview image'}
-        />
-      </div>
-      {props.showCaption && props.node.alt && (
-        <figcaption className="image-node__caption">
-          {props.node.alt}
-        </figcaption>
-      )}
-    </figure>
+    <img
+      src={props.node.src}
+      alt={String(props.node.alt ?? props.node.title ?? '')}
+      title={String(props.node.title ?? props.node.alt ?? '')}
+      className="image-node__img is-loaded"
+      loading={props.lazy === false ? 'eager' : 'lazy'}
+      decoding="async"
+      tabIndex={0}
+      aria-label={props.node.alt ?? 'Preview image'}
+    />
   )
 }
 
@@ -833,7 +868,36 @@ export function ReferenceNode(props: NodeComponentProps<{ type: 'reference', id:
   )
 }
 
-export function HtmlBlockNode(props: NodeComponentProps<{ type: 'html_block', content?: string }>) {
+export function HtmlBlockNode(props: NodeComponentProps<{
+  type: 'html_block'
+  content?: string
+  tag?: string
+  attrs?: [string, string | null][] | null
+  children?: ParsedNode[]
+}>) {
+  const structuredTag = String((props.node as any)?.tag ?? '').trim().toLowerCase()
+  const structuredChildren = Array.isArray((props.node as any)?.children)
+    ? ((props.node as any).children as ParsedNode[])
+    : []
+  if (
+    structuredChildren.length > 0
+    && structuredTag
+    && !NON_STRUCTURING_HTML_TAGS.has(structuredTag)
+    && props.ctx
+    && props.renderNode
+  ) {
+    return React.createElement(
+      structuredTag,
+      mergeHtmlBlockWrapperProps((props.node as any)?.attrs ?? null),
+      renderNodeChildren(
+        structuredChildren,
+        props.ctx,
+        `${String(props.indexKey ?? 'html-block')}-structured`,
+        props.renderNode,
+      ),
+    )
+  }
+
   const customComponents = getCustomNodeComponents(props.customId)
   const nodes = parseHtmlToReactNodes(String(props.node.content ?? ''), customComponents)
   if (nodes == null)
@@ -911,9 +975,11 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
   }
 
   if (node.type === 'html_block' || node.type === 'html_inline') {
-    const tag = String((node as any).tag ?? '').trim().toLowerCase() || getHtmlTagFromContent((node as any).content)
-    const customForTag = tag ? (customComponents as Record<string, any>)[tag] : null
-    if (customForTag) {
+    const resolvedCustomTag = resolveCustomHtmlTag(node as any, customComponents as any, ctx.customHtmlTags)
+    const tag = resolvedCustomTag?.tag ?? ''
+    const isWhitelisted = resolvedCustomTag?.isWhitelisted ?? false
+    const customForTag = resolvedCustomTag?.component ?? null
+    if (isWhitelisted && customForTag) {
       const coerced = {
         ...(node as any),
         type: tag,
@@ -930,6 +996,13 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
         indexKey: key,
         typewriter: ctx.typewriter,
       })
+    }
+    const rawContent = String((node as any).content ?? (node as any).raw ?? '')
+    if (!isWhitelisted && shouldRenderUnknownHtmlTagAsText(rawContent, tag)) {
+      if (node.type === 'html_inline') {
+        return <TextNode key={key} node={{ type: 'text', content: rawContent, raw: rawContent } as any} ctx={ctx} indexKey={key} typewriter={ctx.typewriter} />
+      }
+      return <ParagraphNode key={key} node={{ type: 'paragraph', children: [{ type: 'text', content: rawContent, raw: rawContent }], raw: rawContent } as any} ctx={ctx} renderNode={renderNode} indexKey={key} typewriter={ctx.typewriter} />
     }
   }
 
@@ -1037,7 +1110,7 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
     case 'reference':
       return <ReferenceNode key={key} node={node as any} ctx={ctx} typewriter={ctx.typewriter} />
     case 'html_block':
-      return <HtmlBlockNode key={key} node={node as any} typewriter={ctx.typewriter} customId={ctx.customId} />
+      return <HtmlBlockNode key={key} node={node as any} ctx={ctx} renderNode={renderNode} indexKey={key} typewriter={ctx.typewriter} customId={ctx.customId} />
     case 'html_inline':
       return <HtmlInlineNode key={key} node={node as any} typewriter={ctx.typewriter} customId={ctx.customId} />
     case 'vmr_container':
@@ -1052,20 +1125,13 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
 
 export function NodeRenderer(props: NodeRendererProps) {
   const customComponents = getCustomNodeComponents(props.customId)
-  const inferredCustomHtmlTags = Object.keys(customComponents)
-    .map(String)
-    .map(s => s.trim().toLowerCase())
-    .filter(isHtmlLikeTagName)
 
   const baseParseOptions = props.parseOptions ?? {}
   const optionTags = (baseParseOptions as any).customHtmlTags ?? []
-  const effectiveCustomHtmlTags = Array.from(new Set([
-    ...(props.customHtmlTags ?? []),
-    ...(Array.isArray(optionTags) ? optionTags : []),
-    ...inferredCustomHtmlTags,
-  ]
-    .map(normalizeCustomTag)
-    .filter(Boolean)))
+  const effectiveCustomHtmlTags = mergeCustomHtmlTags(
+    props.customHtmlTags,
+    Array.isArray(optionTags) ? optionTags : [],
+  )
 
   const instanceMsgId = props.customId
     ? `server-renderer-${props.customId}`
@@ -1091,7 +1157,7 @@ export function NodeRenderer(props: NodeRendererProps) {
       : []
 
   const indexPrefix = props.indexKey != null ? String(props.indexKey) : 'markdown-renderer'
-  const renderCtx = createRenderContext(props, customComponents, indexPrefix)
+  const renderCtx = createRenderContext(props, customComponents, indexPrefix, effectiveCustomHtmlTags)
 
   return (
     <div

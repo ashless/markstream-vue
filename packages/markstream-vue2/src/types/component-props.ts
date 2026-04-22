@@ -56,6 +56,7 @@ export interface CodeBlockMonacoOptions {
   themes?: CodeBlockMonacoTheme[]
   languages?: CodeBlockMonacoLanguage[]
   renderSideBySide?: boolean
+  useInlineViewWhenSpaceIsLimited?: boolean
   enableSplitViewResizing?: boolean
   ignoreTrimWhitespace?: boolean
   maxComputationTime?: number
@@ -112,9 +113,7 @@ export interface ImageNodeProps {
     loading?: boolean
   }
   fallbackSrc?: string
-  showCaption?: boolean
   lazy?: boolean
-  svgMinHeight?: string
   usePlaceholder?: boolean
 }
 

@@ -57,13 +57,19 @@ export type { TooltipPlacement, TooltipProps } from './components/Tooltip/Toolti
 export { VmrContainerNode } from './components/VmrContainerNode/VmrContainerNode'
 export {
   clearGlobalCustomComponents,
+  getCustomComponentDisplay,
   getCustomNodeComponents,
   removeCustomComponents,
   setCustomComponents,
+  withMarkstreamComponentDisplay,
+} from './customComponents'
+export type {
+  CustomComponentDisplayMode,
+  MarkstreamCustomComponent,
 } from './customComponents'
 export * from './i18n/useSafeI18n'
 export * from './renderers/renderNode'
-export type { NodeRendererProps } from './types'
+export type { NodeRendererCodeBlockProps, NodeRendererProps } from './types'
 export type {
   CodeBlockDiffAppearance,
   CodeBlockDiffHideUnchangedRegions,
@@ -91,6 +97,7 @@ export type {
 export type { NodeComponentProps } from './types/node-component'
 export * from './utils/languageIcon'
 export * from './workers/katexWorkerClient'
+
 export * from './workers/mermaidWorkerClient'
 
 export type CustomComponentMap = MarkstreamCustomComponentMap

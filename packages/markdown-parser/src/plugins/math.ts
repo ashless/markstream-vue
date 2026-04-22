@@ -314,12 +314,54 @@ function buildCodeSpanRanges(src: string): Array<[number, number]> {
   return ranges
 }
 
-function findCodeSpanRangeAt(ranges: Array<[number, number]>, index: number): [number, number] | null {
+function findRangeAt(ranges: Array<[number, number]>, index: number): [number, number] | null {
   for (const range of ranges) {
     if (index >= range[0] && index < range[1])
       return range
   }
   return null
+}
+
+function buildImageRanges(src: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = []
+  let i = 0
+  while (i < src.length - 1) {
+    if (src[i] === '!' && src[i + 1] === '[') {
+      const start = i
+      let j = i + 2
+      while (j < src.length) {
+        if (src[j] === '\\' && j + 1 < src.length) {
+          j += 2
+          continue
+        }
+        if (src[j] === ']')
+          break
+        j++
+      }
+      if (j < src.length && src[j] === ']' && j + 1 < src.length && src[j + 1] === '(') {
+        let k = j + 2
+        let depth = 1
+        while (k < src.length && depth > 0) {
+          if (src[k] === '\\' && k + 1 < src.length) {
+            k += 2
+            continue
+          }
+          if (src[k] === '(')
+            depth++
+          else if (src[k] === ')')
+            depth--
+          k++
+        }
+        if (depth === 0) {
+          ranges.push([start, k])
+          i = k
+          continue
+        }
+      }
+    }
+    i++
+  }
+  return ranges
 }
 
 function isEscapedAt(src: string, index: number) {
@@ -388,10 +430,28 @@ function isLikelyPlaceholderDollar(content: string) {
 
 export function applyMath(md: MarkdownIt, mathOpts?: MathOptions) {
   // Inline rule for `\\(...\\)` and `$$...$$` and `$...$`
-  const mathInline = (state: unknown, silent: boolean) => {
+  const mathInline = (state: unknown, silent?: boolean) => {
     const s = state as any
     const strict = !!mathOpts?.strictDelimiters
     const allowLoading = !s?.env?.__markstreamFinal
+
+    const preserveSpacesBeforeLineBreak = (src: string, start: number) => {
+      let end = start
+      while (end < src.length && (src[end] === ' ' || src[end] === '\t'))
+        end++
+
+      if (end === start)
+        return start
+
+      const hitsLineBreak = src[end] === '\n' || (src[end] === '\r' && src[end + 1] === '\n')
+      if (!hitsLineBreak)
+        return start
+
+      const text = src.slice(start, end)
+      const token = s.push('text', '', 0)
+      token.content = text
+      return end
+    }
 
     if (/^\*[^*]+/.test(s.src)) {
       return false
@@ -422,6 +482,7 @@ export function applyMath(md: MarkdownIt, mathOpts?: MathOptions) {
       // We'll scan the entire inline source and tokenize all occurrences
       const src = s.src
       const codeSpanRanges = buildCodeSpanRanges(src)
+      const imageRanges = buildImageRanges(src)
       let foundAny = false
       // Reset searchPos for $$ to allow it to scan the full content
       // even after $ rule has processed some text
@@ -604,9 +665,15 @@ export function applyMath(md: MarkdownIt, mathOpts?: MathOptions) {
           continue
         }
 
-        const codeSpanAtIndex = findCodeSpanRangeAt(codeSpanRanges, index)
+        const codeSpanAtIndex = findRangeAt(codeSpanRanges, index)
         if (codeSpanAtIndex) {
           searchPos = codeSpanAtIndex[1]
+          continue
+        }
+
+        const imageRangeAtIndex = findRangeAt(imageRanges, index)
+        if (imageRangeAtIndex) {
+          searchPos = imageRangeAtIndex[1]
           continue
         }
 
@@ -803,12 +870,15 @@ export function applyMath(md: MarkdownIt, mathOpts?: MathOptions) {
             // Always advance cursor past the math span; otherwise when the math
             // is at end-of-line (raw === ''), we'd loop forever on the same opener.
             // 这里的 raw 可能还会有 math_inline, 应该交给后续的规则处理，直接 s.pos 到当前位置
-            s.pos = endIdx + close.length
+            s.pos = preserveSpacesBeforeLineBreak(src, endIdx + close.length)
             searchPos = s.pos
             preMathPos = searchPos
             if (!isBeforeClose)
               s.push('strong_close', '', 0)
-            continue
+            // Leave the remaining inline suffix to markdown-it so later rules
+            // (for example superscript, footnotes, or strong/emphasis) can
+            // tokenize it normally instead of being collapsed into plain text.
+            return true
           }
           else {
             const token = s.push('math_inline', 'math', 0)
@@ -819,9 +889,14 @@ export function applyMath(md: MarkdownIt, mathOpts?: MathOptions) {
           }
         }
 
-        searchPos = endIdx + close.length
+        searchPos = preserveSpacesBeforeLineBreak(src, endIdx + close.length)
         preMathPos = searchPos
         s.pos = searchPos
+        // Do not consume the trailing suffix here. Returning now lets the
+        // inline parser continue from the end of the math token so adjacent
+        // markdown like `^[1]^`, `[^1]`, or `**strong**` is still parsed by
+        // the normal rules.
+        return true
       }
 
       if (foundAny) {

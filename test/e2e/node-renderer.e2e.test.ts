@@ -15,6 +15,7 @@ interface Scenario {
   markdown: string
   expectedText?: string | string[]
   props?: Record<string, any>
+  mountOptions?: Record<string, any>
   assert?: (wrapper: VueWrapper<any>) => void | Promise<void>
   skipSnapshot?: boolean
 }
@@ -23,13 +24,14 @@ let MarkdownRender: any
 
 // Use shared flushAll from test/setup/flush-all
 
-async function mountMarkdown(markdown: string, props: Record<string, any> = {}) {
+async function mountMarkdown(markdown: string, props: Record<string, any> = {}, mountOptions: Record<string, any> = {}) {
   const wrapper = mount(MarkdownRender, {
     props: {
       content: markdown,
       ...props,
       customMarkdownIt: (md: any) => md.use(markdownItEmoji),
     },
+    ...mountOptions,
   })
   await flushAll()
   return wrapper
@@ -40,6 +42,16 @@ function normalizeText(input: string) {
 }
 
 function sanitizeSnapshotHtml(html: string, name: string) {
+  html = html.replace(/class="([^"]*)"/g, (_, classNames: string) => {
+    const normalized = classNames
+      .split(/\s+/)
+      .filter(Boolean)
+      .filter(className => !/^typewriter-(?:enter|leave)(?:-(?:from|to|active))?$/.test(className))
+      .join(' ')
+
+    return normalized ? `class="${normalized}"` : ''
+  })
+
   if (name.includes('admonition'))
     return html.replace(/admonition-[a-z0-9]+/gi, 'admonition-stable')
   return html
@@ -108,10 +120,10 @@ describe('markdownRender node e2e coverage', () => {
       markdown: '- [x] Completed task\n- [ ] Pending task',
       expectedText: ['Completed task', 'Pending task'],
       assert: (wrapper) => {
-        const inputs = wrapper.findAll('input[type="checkbox"]')
-        expect(inputs).toHaveLength(2)
-        expect((inputs[0].element as HTMLInputElement).checked).toBe(true)
-        expect((inputs[1].element as HTMLInputElement).checked).toBe(false)
+        const checkboxes = wrapper.findAll('.checkbox-node')
+        expect(checkboxes).toHaveLength(2)
+        expect(checkboxes[0].find('.checkbox-checked').exists()).toBe(true)
+        expect(checkboxes[1].find('.checkbox-unchecked').exists()).toBe(true)
       },
     },
     {
@@ -127,14 +139,163 @@ describe('markdownRender node e2e coverage', () => {
     {
       name: 'image node',
       markdown: '![Vue Logo](https://example.com/vue.png "Vue Logo")',
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
       assert: (wrapper) => {
-        const figure = wrapper.find('figure')
-        expect(figure.exists()).toBe(true)
-        const img = figure.find('img')
+        const paragraph = wrapper.find('p.paragraph-node')
+        expect(paragraph.exists()).toBe(true)
+        expect(paragraph.find('figure').exists()).toBe(false)
+        expect(paragraph.findAll('img')).toHaveLength(1)
+        const img = paragraph.find('img')
         expect(img.exists()).toBe(true)
         expect(img.attributes('src')).toBe('https://example.com/vue.png')
         expect(img.attributes('title')).toBe('Vue Logo')
-        expect(figure.html()).toContain('Vue Logo')
+      },
+    },
+    {
+      name: 'single badge image with trailing newline stays inline',
+      markdown: '![License](https://img.shields.io/npm/l/markstream-vue)\n',
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
+      assert: (wrapper) => {
+        const paragraph = wrapper.find('p.paragraph-node')
+        expect(paragraph.exists()).toBe(true)
+        expect(paragraph.find('figure').exists()).toBe(false)
+        expect(paragraph.findAll('img')).toHaveLength(1)
+        const img = paragraph.find('img')
+        expect(img.exists()).toBe(true)
+        expect(img.attributes('src')).toBe('https://img.shields.io/npm/l/markstream-vue')
+      },
+    },
+    {
+      name: 'image paragraph separated by blank lines stays inline',
+      markdown: `Before
+
+![Vue Logo](https://example.com/vue.png "Vue Logo")
+
+After`,
+      expectedText: ['Before', 'After'],
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
+      skipSnapshot: true,
+      assert: (wrapper) => {
+        const paragraphs = wrapper.findAll('p.paragraph-node')
+        expect(paragraphs).toHaveLength(3)
+        const imageParagraph = paragraphs[1]
+        expect(imageParagraph.find('figure').exists()).toBe(false)
+        expect(imageParagraph.findAll('img')).toHaveLength(1)
+        const img = imageParagraph.find('img')
+        expect(img.exists()).toBe(true)
+        expect(img.attributes('src')).toBe('https://example.com/vue.png')
+        expect(img.attributes('title')).toBe('Vue Logo')
+      },
+    },
+    {
+      name: 'inline image inside text stays inline',
+      markdown: 'Before ![Vue Logo](https://example.com/vue.png "Vue Logo") after.',
+      expectedText: ['Before', 'after.'],
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
+      skipSnapshot: true,
+      assert: (wrapper) => {
+        const paragraph = wrapper.find('p.paragraph-node')
+        expect(paragraph.exists()).toBe(true)
+        expect(paragraph.find('figure').exists()).toBe(false)
+        expect(paragraph.findAll('img')).toHaveLength(1)
+        const img = paragraph.find('img')
+        expect(img.exists()).toBe(true)
+        expect(img.attributes('src')).toBe('https://example.com/vue.png')
+      },
+    },
+    {
+      name: 'image links in same paragraph stay inline',
+      markdown: `[![NPM version](https://img.shields.io/npm/v/markstream-vue?color=a1b858&label=)](https://www.npmjs.com/package/markstream-vue)
+[![Playground](https://img.shields.io/badge/playground-live-34c759)](https://markstream-vue.simonhe.me/)
+[![CI](https://github.com/Simon-He95/markstream-vue/actions/workflows/ci.yml/badge.svg)](https://github.com/Simon-He95/markstream-vue/actions/workflows/ci.yml)`,
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
+      skipSnapshot: true,
+      assert: (wrapper) => {
+        const paragraph = wrapper.find('p.paragraph-node')
+        expect(paragraph.exists()).toBe(true)
+        expect(paragraph.element.tagName).toBe('P')
+
+        const childTagNames = Array.from(paragraph.element.children).map(child => child.tagName)
+        expect(childTagNames).toEqual(['A', 'A', 'A'])
+
+        const links = paragraph.findAll('a.link-node')
+        expect(links).toHaveLength(3)
+
+        const images = paragraph.findAll('img')
+        expect(images).toHaveLength(3)
+        expect(paragraph.findAll('figure')).toHaveLength(0)
+        // Each link should contain an img (possibly wrapped in a container span)
+        const linksWithImages = links.filter(link => link.find('img').exists())
+        expect(linksWithImages).toHaveLength(3)
+        expect(images[0].attributes('src')).toContain('img.shields.io/npm/v/markstream-vue')
+        expect(images[1].attributes('src')).toContain('img.shields.io/badge/playground-live-34c759')
+        expect(images[2].attributes('src')).toContain('/badge.svg')
+      },
+    },
+    {
+      name: 'image links with relative target stay inline',
+      markdown: `[![NPM version](https://img.shields.io/npm/v/markstream-vue?color=a1b858&label=)](https://www.npmjs.com/package/markstream-vue)
+[![中文版](https://img.shields.io/badge/docs-中文文档-blue)](README.zh-CN.md)`,
+      mountOptions: {
+        global: {
+          stubs: {
+            'transition': false,
+            'transition-group': false,
+          },
+        },
+      },
+      assert: (wrapper) => {
+        const paragraph = wrapper.find('p.paragraph-node')
+        expect(paragraph.exists()).toBe(true)
+        expect(paragraph.element.tagName).toBe('P')
+
+        const childTagNames = Array.from(paragraph.element.children).map(child => child.tagName)
+        expect(childTagNames).toEqual(['A', 'A'])
+
+        const links = paragraph.findAll('a.link-node')
+        expect(links).toHaveLength(2)
+        expect(paragraph.findAll('span.text-node')).toHaveLength(0)
+
+        const images = paragraph.findAll('img')
+        expect(images).toHaveLength(2)
+        expect(links[0].find('img').exists()).toBe(true)
+        expect(links[1].find('img').exists()).toBe(true)
+        expect(links[1].attributes('href')).toBe('README.zh-CN.md')
       },
     },
     {
@@ -411,7 +572,7 @@ describe('markdownRender node e2e coverage', () => {
         const reference = wrapper.find('span.reference-node')
         expect(reference.exists()).toBe(true)
         expect(reference.text()).toBe('1')
-        expect(reference.classes()).toContain('text-[hsl(var(--muted-foreground))]')
+        expect(reference.classes()).toContain('reference-node')
       },
     },
     {
@@ -424,7 +585,7 @@ describe('markdownRender node e2e coverage', () => {
 
   for (const scenario of scenarios) {
     it(`renders ${scenario.name}`, async () => {
-      const wrapper = await mountMarkdown(scenario.markdown, scenario.props)
+      const wrapper = await mountMarkdown(scenario.markdown, scenario.props, scenario.mountOptions)
       try {
         if (scenario.assert)
           await scenario.assert(wrapper)

@@ -250,37 +250,20 @@ li .paragraph-node {
   font-size: 0.875rem;
 }
 
-.image-node {
-  margin: 2rem auto;
-  text-align: center;
-}
-
-.image-node__inner {
-  position: relative;
-  display: inline-block;
-  max-width: 24rem;
-}
-
 .image-node__img {
   display: inline-block;
-  max-width: 24rem;
-  width: 100%;
-  border-radius: 0.75rem;
+  max-width: none;
+  width: auto;
   height: auto;
+  min-height: 0;
+  vertical-align: middle;
+  border-radius: 0.75rem;
   opacity: 0;
   transition: opacity 200ms ease;
-  box-shadow: 0 15px 35px rgba(15, 23, 42, 0.08);
 }
 
 .image-node__img.is-loaded {
   opacity: 1;
-}
-
-.image-node__caption {
-  margin-top: 0.5rem;
-  font-size: 0.875rem;
-  color: #6b7280;
-  font-style: italic;
 }
 
 .image-node__placeholder,
@@ -289,9 +272,10 @@ li .paragraph-node {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  width: 100%;
+  width: auto;
   padding: 1.5rem;
   border-radius: 0.75rem;
+  vertical-align: middle;
 }
 
 .image-node__placeholder {
@@ -540,7 +524,6 @@ li .paragraph-node {
 
 .code-block-body {
   position: relative;
-  min-height: 120px;
 }
 
 .code-block-body--expanded {
@@ -551,10 +534,6 @@ li .paragraph-node {
   min-height: 0;
   height: 0;
   overflow: hidden;
-}
-
-.code-block-monaco {
-  min-height: 120px;
 }
 
 .code-block-overlay {
@@ -1134,11 +1113,6 @@ li .paragraph-node {
 
 .code-editor-container {
   transition: height 180ms ease, max-height 180ms ease;
-  min-height: 120px;
-}
-
-.code-height-placeholder {
-  min-height: 120px;
 }
 
 .code-block-container.is-plain-text:not(.is-diff) .monaco-editor,
@@ -1658,10 +1632,9 @@ li .paragraph-node {
 /* Prevent mermaid temporary render containers from causing layout shift */
 body > div[id^="dmermaid-"] {
   position: fixed;
-  top: 0;
+  top: -10000px;
   left: 0;
-  width: 0;
-  height: 0;
-  overflow: hidden;
+  width: 100%;
+  visibility: hidden;
   pointer-events: none;
 }

@@ -1,4 +1,7 @@
 import type { InlineCodeNode, MarkdownToken, ParsedNode } from '../../types'
+import { VOID_HTML_TAGS } from '../../htmlTags'
+import { parseTagAttrs } from '../../htmlTagUtils'
+import { normalizeCustomTag } from '../customHtmlTags'
 import { buildAllowedHtmlTagSet } from '../index'
 
 type ParseInlineTokensFn = (
@@ -7,23 +10,6 @@ type ParseInlineTokensFn = (
   pPreToken?: MarkdownToken,
   options?: { requireClosingStrong?: boolean, customHtmlTags?: readonly string[] },
 ) => ParsedNode[]
-
-const VOID_TAGS = new Set([
-  'area',
-  'base',
-  'br',
-  'col',
-  'embed',
-  'hr',
-  'img',
-  'input',
-  'link',
-  'meta',
-  'param',
-  'source',
-  'track',
-  'wbr',
-])
 
 interface TagSetCacheEntry {
   customTagSet: Set<string> | null
@@ -53,15 +39,7 @@ function isClosingTag(html: string) {
 }
 
 function isSelfClosing(tag: string, html: string) {
-  return /\/\s*>\s*$/.test(html) || VOID_TAGS.has(tag)
-}
-
-function normalizeCustomTag(t: unknown) {
-  const raw = String(t ?? '').trim()
-  if (!raw)
-    return ''
-  const m = raw.match(/^[<\s/]*([A-Z][\w-]*)/i)
-  return m ? m[1].toLowerCase() : ''
+  return /\/\s*>\s*$/.test(html) || VOID_HTML_TAGS.has(tag)
 }
 
 function getTagSets(customTags?: readonly string[]) {
@@ -92,20 +70,6 @@ function tokenToRaw(token: MarkdownToken) {
 
 type AttrTuple = [string, string]
 
-function parseTagAttrs(openTag: string): AttrTuple[] {
-  const attrs: AttrTuple[] = []
-  const attrRegex = /\s([\w:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g
-  let match
-  while ((match = attrRegex.exec(openTag)) !== null) {
-    const attrName = match[1]
-    if (!attrName)
-      continue
-    const attrValue = match[2] || match[3] || match[4] || ''
-    attrs.push([attrName, attrValue])
-  }
-  return attrs
-}
-
 function getAttrValue(attrs: AttrTuple[], name: string): string | undefined {
   const lowerName = name.toLowerCase()
   for (let i = attrs.length - 1; i >= 0; i--) {
@@ -133,6 +97,49 @@ function normalizeLinkAttrs(
 
 function stringifyTokens(tokens: MarkdownToken[]) {
   return tokens.map(tokenToRaw).join('')
+}
+
+function normalizeStandardHtmlChildren(children: ParsedNode[]) {
+  const normalized: ParsedNode[] = []
+
+  const pushText = (rawText: string) => {
+    const text = String(rawText ?? '')
+    if (!text)
+      return
+    const last = normalized[normalized.length - 1] as ParsedNode | undefined
+    if (last?.type === 'text') {
+      ; (last as any).content = String((last as any).content ?? '') + text
+      ; (last as any).raw = String((last as any).raw ?? '') + text
+      return
+    }
+    normalized.push({
+      type: 'text',
+      content: text,
+      raw: text,
+    } as ParsedNode)
+  }
+
+  for (const child of children) {
+    if (!child)
+      continue
+
+    if (child.type === 'reference' || child.type === 'footnote_reference') {
+      pushText(String((child as any).raw ?? ''))
+      continue
+    }
+
+    if (Array.isArray((child as any).children)) {
+      normalized.push({
+        ...(child as any),
+        children: normalizeStandardHtmlChildren(((child as any).children ?? []) as ParsedNode[]),
+      } as ParsedNode)
+      continue
+    }
+
+    normalized.push(child)
+  }
+
+  return normalized
 }
 
 function findMatchingClosing(tokens: MarkdownToken[], startIndex: number, tag: string) {
@@ -264,10 +271,11 @@ export function parseHtmlInlineCodeToken(
     const children = innerTokens.length
       ? parseInlineTokens(innerTokens, raw, pPreToken, options)
       : []
+    const normalizedChildren = normalizeStandardHtmlChildren(children)
     const textContent = innerTokens.length ? stringifyTokens(innerTokens) : href || ''
 
-    if (!children.length && textContent) {
-      children.push({
+    if (!normalizedChildren.length && textContent) {
+      normalizedChildren.push({
         type: 'text',
         content: textContent,
         raw: textContent,
@@ -281,7 +289,7 @@ export function parseHtmlInlineCodeToken(
         title,
         text: textContent,
         attrs: normalizedAttrs,
-        children,
+        children: normalizedChildren,
         loading: !fragment.closed,
         raw: fragment.html || code,
       } as ParsedNode,
@@ -310,10 +318,11 @@ export function parseHtmlInlineCodeToken(
     const children = fragment.innerTokens.length
       ? parseInlineTokens(fragment.innerTokens, raw, pPreToken, options)
       : []
+    const normalizedChildren = normalizeStandardHtmlChildren(children)
     return [
       {
         type: 'paragraph',
-        children,
+        children: normalizedChildren,
         raw: fragment.html,
       } as ParsedNode,
       fragment.nextIndex,
@@ -323,6 +332,7 @@ export function parseHtmlInlineCodeToken(
   const children = fragment.innerTokens.length
     ? parseInlineTokens(fragment.innerTokens, raw, pPreToken, options)
     : []
+  const normalizedChildren = normalizeStandardHtmlChildren(children)
 
   let content = fragment.html || code
   let loading = !fragment.closed
@@ -372,7 +382,7 @@ export function parseHtmlInlineCodeToken(
       tag,
       attrs,
       content,
-      children,
+      children: normalizedChildren,
       raw: content,
       loading,
       autoClosed,

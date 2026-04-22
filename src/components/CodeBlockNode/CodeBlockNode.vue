@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { CodeBlockNodeProps } from '../../types/component-props'
+import type { CodeBlockMonacoTheme, CodeBlockNodeProps } from '../../types/component-props'
+import type { MonacoDiffEditorViewLike, MonacoDisposableLike, MonacoEditorViewLike, MonacoNamespaceLike, MonacoRuntimeOptions } from './monaco'
 // Avoid static import of `stream-monaco` for types so the runtime bundle
 // doesn't get a reference. Define minimal local types we need here.
 import { computed, getCurrentInstance, nextTick, onBeforeUnmount, onUnmounted, ref, watch } from 'vue'
@@ -10,12 +11,19 @@ import { useViewportPriority } from '../../composables/viewportPriority'
 import { getLanguageIcon, languageIconsRevision, languageMap, normalizeLanguageIdentifier, resolveMonacoLanguageId } from '../../utils'
 import { safeCancelRaf, safeRaf } from '../../utils/safeRaf'
 import PreCodeNode from '../PreCodeNode'
+import CodeBlockShell from './CodeBlockShell.vue'
 import HtmlPreviewFrame from './HtmlPreviewFrame.vue'
-import { getUseMonaco } from './monaco'
+import {
+  getUseMonaco,
+
+} from './monaco'
 import { scheduleGlobalMonacoTheme } from './monacoThemeScheduler'
 
 const props = withDefaults(
-  defineProps<CodeBlockNodeProps>(),
+  defineProps<CodeBlockNodeProps & {
+    estimatedHeightPx?: number
+    estimatedContentHeightPx?: number
+  }>(),
   {
     isShowPreview: true,
     darkTheme: 'vitesse-dark',
@@ -39,34 +47,70 @@ const props = withDefaults(
 const emits = defineEmits(['previewCode', 'copy'])
 
 // Chrome warns when Monaco registers non-passive touchstart listeners.
-// Patch the editor host so touch handlers default to passive for Monaco roots.
-const MONACO_TOUCH_PATCH_FLAG = '__markstreamMonacoPassiveTouch__'
+// Scope the workaround to editor boot so the host page prototype is restored.
+const MONACO_TOUCH_PATCH_STATE_KEY = '__markstreamMonacoPassiveTouchState__'
+type AddEventListenerFn = Element['addEventListener']
 
-if (typeof window !== 'undefined')
-  ensureMonacoPassiveTouchListeners()
+interface MonacoTouchPatchState {
+  depth: number
+  original: AddEventListenerFn | null
+}
 
-function ensureMonacoPassiveTouchListeners() {
+function getMonacoTouchPatchState() {
+  const globalObj = window as Window
+  const stateStore = globalObj as unknown as Record<string, unknown>
+  const existing = stateStore[MONACO_TOUCH_PATCH_STATE_KEY] as MonacoTouchPatchState | undefined
+  if (existing)
+    return existing
+  const next: MonacoTouchPatchState = {
+    depth: 0,
+    original: null,
+  }
+  stateStore[MONACO_TOUCH_PATCH_STATE_KEY] = next
+  return next
+}
+
+async function withMonacoPassiveTouchListeners<T>(task: () => Promise<T> | T) {
+  if (typeof window === 'undefined')
+    return await task()
+
   try {
-    const globalObj = window as any
-    if (globalObj[MONACO_TOUCH_PATCH_FLAG])
-      return
     const proto = window.Element?.prototype
     const nativeAdd = proto?.addEventListener
     if (!proto || !nativeAdd)
-      return
-    proto.addEventListener = function patchedMonacoTouchStart(
-      this: Element,
-      type: string,
-      listener: EventListenerOrEventListenerObject,
-      options?: boolean | AddEventListenerOptions,
-    ) {
-      if (type === 'touchstart' && shouldForcePassiveForMonaco(this, options))
-        return nativeAdd.call(this, type, listener, withPassiveOptions(options))
-      return nativeAdd.call(this, type, listener, options)
+      return await task()
+
+    const state = getMonacoTouchPatchState()
+    if (state.depth === 0) {
+      state.original = nativeAdd
+      proto.addEventListener = function patchedMonacoTouchStart(
+        this: Element,
+        type: string,
+        listener: EventListenerOrEventListenerObject,
+        options?: boolean | AddEventListenerOptions,
+      ) {
+        const original = state.original ?? nativeAdd
+        if (type === 'touchstart' && shouldForcePassiveForMonaco(this, options))
+          return original.call(this, type, listener, withPassiveOptions(options))
+        return original.call(this, type, listener, options)
+      }
     }
-    globalObj[MONACO_TOUCH_PATCH_FLAG] = true
+
+    state.depth++
+    try {
+      return await task()
+    }
+    finally {
+      state.depth = Math.max(0, state.depth - 1)
+      if (state.depth === 0 && state.original && proto.addEventListener !== state.original) {
+        proto.addEventListener = state.original
+        state.original = null
+      }
+    }
   }
-  catch {}
+  catch {
+    return await task()
+  }
 }
 
 function shouldForcePassiveForMonaco(target: EventTarget | null, options?: boolean | AddEventListenerOptions) {
@@ -95,6 +139,11 @@ function withPassiveOptions(options?: boolean | AddEventListenerOptions): AddEve
   return { passive: true }
 }
 
+function warnCodeBlockDev(context: string, error: unknown) {
+  if (import.meta.env?.DEV)
+    console.warn(`[markstream-vue] ${context}:`, error)
+}
+
 const instance = getCurrentInstance()
 const hasPreviewListener = computed(() => {
   const props = instance?.vnode.props as Record<string, unknown> | null | undefined
@@ -115,9 +164,12 @@ const isCollapsed = ref(false)
 const editorCreated = ref(false)
 const editorMounted = ref(false)
 const monacoReady = ref(false)
+let isUnmounted = false
 let expandRafId: number | null = null
 let deferredHeightSyncRafId: number | null = null
 const heightBeforeCollapse = ref<number | null>(null)
+const lastStableCollapsedDiffHeight = ref<number | null>(null)
+let collapsedDiffSettleGuardUntil = 0
 let resumeGuardFrames = 0
 const registerVisibility = useViewportPriority()
 const viewportHandle = ref<ReturnType<typeof registerVisibility> | null>(null)
@@ -143,6 +195,7 @@ if (typeof window !== 'undefined') {
   )
 }
 onBeforeUnmount(() => {
+  isUnmounted = true
   viewportHandle.value?.destroy()
   viewportHandle.value = null
 })
@@ -150,25 +203,26 @@ onBeforeUnmount(() => {
 // Lazy-load `stream-monaco` helpers at runtime so consumers who don't install
 // `stream-monaco` won't have the editor code bundled. We provide safe no-op
 // fallbacks for the minimal API we use.
-let createEditor: ((el: HTMLElement, code: string, lang: string) => void) | null = null
-let createDiffEditor: ((el: HTMLElement, original: string, modified: string, lang: string) => void) | null = null
-let updateCode: (code: string, lang: string) => void = () => {}
-let updateDiffCode: (original: string, modified: string, lang: string) => void = () => {}
-let getEditor: () => any = () => null
-let getEditorView: () => any = () => ({ getModel: () => ({ getLineCount: () => 1 }), getOption: () => 14, updateOptions: () => {} })
-let getDiffEditorView: () => any = () => ({ getModel: () => ({ getLineCount: () => 1 }), getOption: () => 14, updateOptions: () => {} })
+let createEditor: ((el: HTMLElement, code: string, lang: string) => Promise<unknown> | unknown) | null = null
+let createDiffEditor: ((el: HTMLElement, original: string, modified: string, lang: string) => Promise<unknown> | unknown) | null = null
+let updateCode: (code: string, lang: string) => Promise<unknown> | unknown = () => {}
+let updateDiffCode: (original: string, modified: string, lang: string) => Promise<unknown> | unknown = () => {}
+let getEditor: () => MonacoNamespaceLike | null = () => null
+let getEditorView: () => MonacoEditorViewLike | null = () => ({ getModel: () => ({ getLineCount: () => 1 }), getOption: () => 14, updateOptions: () => {} })
+let getDiffEditorView: () => MonacoDiffEditorViewLike | null = () => ({ getModel: () => ({ getLineCount: () => 1 }), getOption: () => 14, updateOptions: () => {} })
 let cleanupEditor: () => void = () => {}
 let safeClean = () => {}
 let refreshDiffPresentation: () => void = () => {}
 let createEditorPromise: Promise<void> | null = null
 let detectLanguage: (code: string) => string = () => String(props.node.language ?? 'plaintext')
-let setTheme: (theme: any) => Promise<void> = async () => {}
-const editorHeightSyncDisposables: Array<{ dispose?: () => void }> = []
+let setTheme: (theme: CodeBlockMonacoTheme | undefined) => Promise<void> | void = async () => {}
+const editorHeightSyncDisposables: MonacoDisposableLike[] = []
 const inlineFoldProxyCleanups: Array<() => void> = []
-let runtimeMonacoOptions: Record<string, any> | null = null
+let runtimeMonacoOptions: MonacoRuntimeOptions | null = null
 const isDiff = computed(() => props.node.diff)
 const diffStats = ref({ removed: 0, added: 0 })
 const diffStatsAriaLabel = computed(() => `-${diffStats.value.removed} +${diffStats.value.added}`)
+const disabledDiffHideUnchangedRegions = Object.freeze({ enabled: false })
 const defaultDiffHideUnchangedRegions = Object.freeze({
   enabled: true,
   contextLineCount: 2,
@@ -188,6 +242,14 @@ function resolveDiffHideUnchangedRegionsOption(value: unknown) {
   }
   return { ...defaultDiffHideUnchangedRegions }
 }
+
+function resolveDiffRenderPair(original: string, updated: string) {
+  return {
+    original: String(original ?? ''),
+    updated: String(updated ?? ''),
+  }
+}
+
 const resolvedMonacoOptions = computed(() => {
   const raw = props.monacoOptions ? { ...props.monacoOptions } : {}
   if (!isDiff.value)
@@ -198,11 +260,17 @@ const resolvedMonacoOptions = computed(() => {
   const hideUnchangedRegions = raw.hideUnchangedRegions === undefined
     ? undefined
     : resolveDiffHideUnchangedRegionsOption(raw.hideUnchangedRegions)
+  const streamPreviewDiff = props.stream !== false && props.loading !== false
+  const activeDiffHideUnchangedRegions = streamPreviewDiff
+    ? { ...disabledDiffHideUnchangedRegions }
+    : diffHideUnchangedRegions
+  const activeHideUnchangedRegions = streamPreviewDiff
+    ? { ...disabledDiffHideUnchangedRegions }
+    : hideUnchangedRegions
+  const experimental = {
+    ...((raw.experimental as Record<string, unknown> | undefined) ?? {}),
+  }
   const diffUnchangedRegionStyle = raw.diffUnchangedRegionStyle ?? 'line-info'
-  const needsExtraBottomSpace
-    = diffUnchangedRegionStyle === 'line-info'
-      || diffUnchangedRegionStyle === 'line-info-basic'
-      || diffUnchangedRegionStyle === 'metadata'
   const diffDefaults = {
     maxComputationTime: 0,
     diffAlgorithm: 'legacy',
@@ -214,28 +282,27 @@ const resolvedMonacoOptions = computed(() => {
     selectionHighlight: false,
     occurrencesHighlight: 'off',
     matchBrackets: 'never',
-    lineDecorationsWidth: 12,
+    lineDecorationsWidth: 4,
     lineNumbersMinChars: 2,
     glyphMargin: false,
-    fontSize: 13,
-    lineHeight: 30,
     renderOverviewRuler: false,
     overviewRulerBorder: false,
     hideCursorInOverviewRuler: true,
     scrollBeyondLastLine: false,
-    padding: { top: 10, bottom: needsExtraBottomSpace ? 22 : 14 },
-    diffHideUnchangedRegions,
+    diffHideUnchangedRegions: activeDiffHideUnchangedRegions,
+    useInlineViewWhenSpaceIsLimited: raw.useInlineViewWhenSpaceIsLimited ?? false,
     diffLineStyle: 'background',
     diffAppearance: 'auto',
     diffUnchangedRegionStyle,
-    diffHunkActionsOnHover: true,
-    diffHunkHoverHideDelayMs: 160,
+    diffHunkActionsOnHover: false,
+    experimental,
   }
   return {
     ...diffDefaults,
     ...raw,
-    ...(hideUnchangedRegions === undefined ? {} : { hideUnchangedRegions }),
-    diffHideUnchangedRegions,
+    experimental,
+    ...(activeHideUnchangedRegions === undefined ? {} : { hideUnchangedRegions: activeHideUnchangedRegions }),
+    diffHideUnchangedRegions: activeDiffHideUnchangedRegions,
   }
 })
 
@@ -247,7 +314,7 @@ const desiredEditorKind = computed<'diff' | 'single'>(() => (isDiff.value ? 'dif
 const currentEditorKind = ref<'diff' | 'single'>(desiredEditorKind.value)
 const usePreCodeRender = ref(false)
 const preFallbackWrap = computed(() => {
-  const wordWrap = (props.monacoOptions as any)?.wordWrap
+  const wordWrap = props.monacoOptions?.wordWrap
   // Keep consistent with CodeBlockNode's default `wordWrap: 'on'`.
   if (wordWrap == null)
     return true
@@ -266,6 +333,8 @@ if (typeof window !== 'undefined') {
   ;(async () => {
     try {
       const mod = await getUseMonaco()
+      if (isUnmounted)
+        return
       // If mod is null, stream-monaco is not available
       if (!mod) {
         // Only log warning in development mode
@@ -276,8 +345,8 @@ if (typeof window !== 'undefined') {
         return
       }
       // `useMonaco` and `detectLanguage` should be available
-      const useMonaco = (mod as any).useMonaco
-      const det = (mod as any).detectLanguage
+      const useMonaco = mod.useMonaco
+      const det = mod.detectLanguage
       if (typeof det === 'function')
         detectLanguage = det
       if (typeof useMonaco === 'function') {
@@ -300,11 +369,13 @@ if (typeof window !== 'undefined') {
         setTheme = helpers.setTheme || setTheme
         monacoReady.value = true
 
-        if (codeEditor.value)
+        if (!isUnmounted && codeEditor.value)
           await ensureEditorCreation(codeEditor.value as HTMLElement)
       }
     }
     catch (err) {
+      if (isUnmounted)
+        return
       // Only log warning in development mode
       if (import.meta.env?.DEV) {
         console.warn('[markstream-vue] Failed to initialize Monaco editor:', err)
@@ -328,7 +399,7 @@ const fontBaselineReady = computed(() => {
   return typeof a === 'number' && Number.isFinite(a) && a > 0 && typeof b === 'number' && Number.isFinite(b) && b > 0
 })
 const preFallbackFontSize = computed(() => {
-  const fromOptions = (props.monacoOptions as any)?.fontSize
+  const fromOptions = props.monacoOptions?.fontSize
   if (typeof fromOptions === 'number' && Number.isFinite(fromOptions) && fromOptions > 0)
     return fromOptions
   const fromState = codeFontSize.value
@@ -337,28 +408,47 @@ const preFallbackFontSize = computed(() => {
   return 12
 })
 const preFallbackLineHeight = computed(() => {
-  const fromOptions = (props.monacoOptions as any)?.lineHeight
+  const fromOptions = props.monacoOptions?.lineHeight
   if (typeof fromOptions === 'number' && Number.isFinite(fromOptions) && fromOptions > 0)
     return fromOptions
   return Math.round(preFallbackFontSize.value * 1.5)
 })
 const preFallbackTabSize = computed(() => {
-  const fromOptions = (props.monacoOptions as any)?.tabSize
+  const fromOptions = props.monacoOptions?.tabSize
   if (typeof fromOptions === 'number' && Number.isFinite(fromOptions) && fromOptions > 0)
     return fromOptions
   // Monaco default is 4.
   return 4
 })
+const estimatedVisibleContentHeight = computed(() => {
+  const value = props.estimatedContentHeightPx
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.round(value)
+    : null
+})
 const preFallbackStyle = computed(() => {
-  const fontFamily = (props.monacoOptions as any)?.fontFamily
+  const fontFamily = props.monacoOptions?.fontFamily
   return {
     fontSize: `${preFallbackFontSize.value}px`,
     lineHeight: `${preFallbackLineHeight.value}px`,
     tabSize: preFallbackTabSize.value,
+    ...(estimatedVisibleContentHeight.value != null
+      ? { minHeight: `${estimatedVisibleContentHeight.value}px` }
+      : {}),
     ...(typeof fontFamily === 'string' && fontFamily.trim()
       ? { '--markstream-code-font-family': fontFamily.trim() }
       : {}),
   } as Record<string, string | number>
+})
+const shouldReserveEstimatedEditorHeight = computed(() => {
+  return estimatedVisibleContentHeight.value != null && !editorMounted.value
+})
+const codeEditorContainerStyle = computed(() => {
+  if (!shouldReserveEstimatedEditorHeight.value)
+    return undefined
+  return {
+    minHeight: `${estimatedVisibleContentHeight.value}px`,
+  }
 })
 // Keep computed height tight to content. Extra padding caused visible bottom gap.
 const CONTENT_PADDING = 0
@@ -390,7 +480,7 @@ function readActualFontSizeFromEditor(): number | null {
     const mon = getEditor()
     const key = mon?.EditorOption?.fontInfo
     if (ed && key != null) {
-      const info = ed.getOption?.(key)
+      const info = ed.getOption?.(key) as { fontSize?: unknown } | undefined
       const size = info?.fontSize
       if (typeof size === 'number' && Number.isFinite(size) && size > 0)
         return size
@@ -418,7 +508,7 @@ function readActualFontSizeFromEditor(): number | null {
   return null
 }
 
-function getLineHeightSafe(editor: any): number {
+function getLineHeightSafe(editor: MonacoEditorViewLike | null | undefined): number {
   try {
     const monacoEditor = getEditor()
     const key = monacoEditor?.EditorOption?.lineHeight
@@ -433,9 +523,32 @@ function getLineHeightSafe(editor: any): number {
   const domH = measureLineHeightFromDom()
   if (domH && domH > 0)
     return domH
-  const fs = Number.isFinite(codeFontSize.value) && codeFontSize.value! > 0 ? (codeFontSize.value as number) : 12
+  const fs = Number.isFinite(codeFontSize.value) && codeFontSize.value! > 0 ? (codeFontSize.value as number) : 14
   // Conservative fallback close to Monaco's default ratio
   return Math.max(12, Math.round(fs * 1.35))
+}
+
+function getVerticalPaddingSafe(editor: MonacoEditorViewLike | null | undefined): number {
+  try {
+    const monacoEditor = getEditor() as { EditorOption?: { padding?: unknown } } | null | undefined
+    const key = monacoEditor?.EditorOption?.padding
+    if (key != null) {
+      const value = editor?.getOption?.(key) as { top?: unknown, bottom?: unknown } | undefined
+      const top = typeof value?.top === 'number' ? value.top : 0
+      const bottom = typeof value?.bottom === 'number' ? value.bottom : 0
+      if (top > 0 || bottom > 0)
+        return top + bottom
+    }
+  }
+  catch {}
+
+  const rawPadding = (resolvedMonacoOptions.value as Record<string, any> | undefined)?.padding as { top?: unknown, bottom?: unknown } | undefined
+  const top = typeof rawPadding?.top === 'number' ? rawPadding.top : 0
+  const bottom = typeof rawPadding?.bottom === 'number' ? rawPadding.bottom : 0
+  if (top > 0 || bottom > 0)
+    return top + bottom
+
+  return isDiff.value ? 24 : 0
 }
 
 function countChangedLineRange(start: number | undefined, end: number | undefined) {
@@ -568,12 +681,13 @@ function resetCodeFont() {
 function computeContentHeight(): number | null {
   // Prefer Monaco's contentHeight when available; fallback to lineCount * lineHeight
   try {
-    const ed = isDiff.value ? getDiffEditorView() : getEditorView()
-    if (!ed)
+    const diffEditor = isDiff.value ? getDiffEditorView() : null
+    const editor = isDiff.value ? diffEditor : getEditorView()
+    if (!editor)
       return null
-    if (isDiff.value && ed?.getOriginalEditor && ed?.getModifiedEditor) {
-      const o = ed.getOriginalEditor?.()
-      const m = ed.getModifiedEditor?.()
+    if (diffEditor?.getOriginalEditor && diffEditor?.getModifiedEditor) {
+      const o = diffEditor.getOriginalEditor?.()
+      const m = diffEditor.getModifiedEditor?.()
       o?.layout?.()
       m?.layout?.()
       const oh = (o?.getContentHeight?.() as number) || 0
@@ -588,20 +702,117 @@ function computeContentHeight(): number | null {
       const lh = Math.max(getLineHeightSafe(o), getLineHeightSafe(m))
       return Math.ceil(lc * (lh + LINE_EXTRA_PER_LINE) + CONTENT_PADDING + PIXEL_EPSILON)
     }
-    else if (ed?.getContentHeight) {
-      ed?.layout?.()
-      const h = ed.getContentHeight()
+    else if (editor?.getContentHeight) {
+      editor?.layout?.()
+      const h = editor.getContentHeight()
       if (h > 0)
         return Math.ceil(h + PIXEL_EPSILON)
     }
     // generic fallback
-    const model = ed?.getModel?.()
+    const model = editor?.getModel?.()
     let lineCount = 1
     if (model && typeof model.getLineCount === 'function') {
       lineCount = model.getLineCount()
     }
-    const lh = getLineHeightSafe(ed)
+    const lh = getLineHeightSafe(editor)
     return Math.ceil(lineCount * (lh + LINE_EXTRA_PER_LINE) + CONTENT_PADDING + PIXEL_EPSILON)
+  }
+  catch {
+    return null
+  }
+}
+
+function measureRenderedDiffHeight(container: HTMLElement): number | null {
+  if (typeof window === 'undefined')
+    return null
+  try {
+    const hostRect = container.getBoundingClientRect()
+    if (hostRect.height <= 0)
+      return null
+
+    const selectors = [
+      '.editor.original .view-lines .view-line',
+      '.editor.modified .view-lines .view-line',
+      '.editor.original .view-zones > div',
+      '.editor.modified .view-zones > div',
+      '.editor.original .margin-view-zones > div',
+      '.editor.modified .margin-view-zones > div',
+      '.editor.original .diff-hidden-lines',
+      '.editor.modified .diff-hidden-lines',
+      '.stream-monaco-diff-unchanged-bridge',
+    ]
+
+    let bottom = 0
+    for (const node of Array.from(container.querySelectorAll(selectors.join(',')))) {
+      if (!(node instanceof HTMLElement))
+        continue
+      const style = window.getComputedStyle(node)
+      if (style.display === 'none' || style.visibility === 'hidden')
+        continue
+      if (Number.parseFloat(style.opacity || '1') <= 0.01)
+        continue
+      const rect = node.getBoundingClientRect()
+      if (rect.height <= 0 || rect.bottom <= hostRect.top)
+        continue
+      bottom = Math.max(bottom, rect.bottom - hostRect.top)
+    }
+
+    if (bottom > 0)
+      return Math.ceil(bottom + PIXEL_EPSILON)
+
+    const diffRoot = container.querySelector('.monaco-diff-editor') as HTMLElement | null
+    const diffHeight = diffRoot?.getBoundingClientRect?.().height ?? 0
+    if (diffHeight > 0)
+      return Math.ceil(diffHeight + PIXEL_EPSILON)
+
+    return null
+  }
+  catch {
+    return null
+  }
+}
+
+function hasVisibleDiffHiddenLines(container: HTMLElement): boolean {
+  if (typeof window === 'undefined')
+    return false
+  const nodes = container.querySelectorAll(
+    '.editor.modified .diff-hidden-lines .center, .stream-monaco-diff-unchanged-bridge',
+  )
+  for (const node of Array.from(nodes)) {
+    if (!(node instanceof HTMLElement))
+      continue
+    const style = window.getComputedStyle(node)
+    if (style.display === 'none' || style.visibility === 'hidden')
+      continue
+    if (Number.parseFloat(style.opacity || '1') <= 0.01)
+      continue
+    const rect = node.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0)
+      continue
+    return true
+  }
+  return false
+}
+
+function estimateDiffEditorContentHeight(): number | null {
+  try {
+    const diffEditor = getDiffEditorView()
+    const originalEditor = diffEditor?.getOriginalEditor?.()
+    const modifiedEditor = diffEditor?.getModifiedEditor?.()
+    if (!originalEditor || !modifiedEditor)
+      return null
+    const originalLines = originalEditor.getModel?.()?.getLineCount?.() || 1
+    const modifiedLines = modifiedEditor.getModel?.()?.getLineCount?.() || 1
+    const lineCount = Math.max(originalLines, modifiedLines)
+    const lineHeight = Math.max(
+      getLineHeightSafe(originalEditor),
+      getLineHeightSafe(modifiedEditor),
+    )
+    const verticalPadding = Math.max(
+      getVerticalPaddingSafe(originalEditor),
+      getVerticalPaddingSafe(modifiedEditor),
+    )
+    return Math.ceil(lineCount * (lineHeight + LINE_EXTRA_PER_LINE) + verticalPadding + CONTENT_PADDING + PIXEL_EPSILON)
   }
   catch {
     return null
@@ -640,10 +851,13 @@ function syncEditorCssVars() {
   const rootEl = container.value as HTMLElement | null
   if (!editorEl || !rootEl)
     return
+  // Target: write --vscode-* vars to the editor container (Monaco zone),
+  // NOT to rootEl (Shell zone). Shell no longer reads these variables.
+  const targetEl = editorEl
   if (isDiff.value) {
-    rootEl.style.removeProperty('--vscode-editor-foreground')
-    rootEl.style.removeProperty('--vscode-editor-background')
-    rootEl.style.removeProperty('--vscode-editor-selectionBackground')
+    targetEl.style.removeProperty('--vscode-editor-foreground')
+    targetEl.style.removeProperty('--vscode-editor-background')
+    targetEl.style.removeProperty('--vscode-editor-selectionBackground')
     return
   }
   // Monaco usually applies theme variables on an element with class
@@ -679,18 +893,18 @@ function syncEditorCssVars() {
   const bg = bgVar || String(bgStyles?.backgroundColor ?? rootStyles?.backgroundColor ?? '').trim()
 
   if (shouldPreferPlainTextFallbackSurface(bg, fg, rootEl.classList.contains('is-dark'))) {
-    rootEl.style.removeProperty('--vscode-editor-foreground')
-    rootEl.style.removeProperty('--vscode-editor-background')
-    rootEl.style.removeProperty('--vscode-editor-selectionBackground')
+    targetEl.style.removeProperty('--vscode-editor-foreground')
+    targetEl.style.removeProperty('--vscode-editor-background')
+    targetEl.style.removeProperty('--vscode-editor-selectionBackground')
     return
   }
 
   if (fg)
-    rootEl.style.setProperty('--vscode-editor-foreground', fg)
+    targetEl.style.setProperty('--vscode-editor-foreground', fg)
   if (bg)
-    rootEl.style.setProperty('--vscode-editor-background', bg)
+    targetEl.style.setProperty('--vscode-editor-background', bg)
   if (selVar)
-    rootEl.style.setProperty('--vscode-editor-selectionBackground', selVar)
+    targetEl.style.setProperty('--vscode-editor-selectionBackground', selVar)
 }
 
 let resizeSyncHandler: (() => void) | null = null
@@ -717,6 +931,8 @@ function resolveScrollRootElement(node?: HTMLElement | null) {
 
 function adjustScrollAfterHeightChange(container: HTMLElement, previousHeight: number, nextHeight: number) {
   if (typeof window === 'undefined')
+    return
+  if (isDiff.value)
     return
   const roundedPrev = Math.ceil(previousHeight)
   const roundedNext = Math.ceil(nextHeight)
@@ -785,44 +1001,55 @@ function clearInlineFoldProxies() {
   }
 }
 
-function syncInlineFoldProxies() {
-  clearInlineFoldProxies()
-
-  if (!isDiff.value)
+function syncEditorHostHeight(_allowDuringStreamingDiff = false) {
+  if (isCollapsed.value)
     return
+  if (isExpanded.value)
+    updateExpandedHeight()
+  else
+    updateCollapsedHeight()
+}
+
+function syncInlineFoldProxies() {
+  if (!isDiff.value) {
+    clearInlineFoldProxies()
+    return
+  }
 
   const root = codeEditor.value
-  if (!root)
+  if (!root) {
+    clearInlineFoldProxies()
     return
+  }
 
   const diffRoot = root.querySelector('.monaco-diff-editor') as HTMLElement | null
-  if (!diffRoot || diffRoot.classList.contains('side-by-side'))
+  if (!diffRoot || diffRoot.classList.contains('side-by-side')) {
+    clearInlineFoldProxies()
     return
+  }
 
   const originalWidgets = Array.from(diffRoot.querySelectorAll('.editor.original .diff-hidden-lines'))
   const modifiedWidgets = Array.from(diffRoot.querySelectorAll('.editor.modified .diff-hidden-lines'))
   const pairCount = Math.min(originalWidgets.length, modifiedWidgets.length)
 
   for (let i = 0; i < pairCount; i++) {
-    const originalWidget = originalWidgets[i] as HTMLElement
     const modifiedWidget = modifiedWidgets[i] as HTMLElement
     const modifiedTrigger = modifiedWidget.querySelector('a') as HTMLElement | null
-    const originalSlot = originalWidget.querySelector('.center > div:first-child') as HTMLElement | null
+    const modifiedSlot = modifiedWidget.querySelector('.center > div:first-child') as HTMLElement | null
+    const modifiedCenter = modifiedWidget.querySelector('.center') as HTMLElement | null
 
-    if (!modifiedTrigger || !originalSlot)
+    if (!modifiedTrigger || !modifiedSlot || !modifiedCenter)
+      continue
+    if (modifiedCenter.querySelector('.markstream-inline-fold-proxy'))
       continue
 
     const proxyButton = document.createElement('button')
     proxyButton.type = 'button'
     proxyButton.className = 'markstream-inline-fold-proxy'
+    proxyButton.dataset.markstreamInlineFoldProxy = 'true'
     const label = modifiedTrigger.getAttribute('title') || 'Show Unchanged Region'
     proxyButton.title = label
     proxyButton.setAttribute('aria-label', label)
-
-    const sourceIcon = modifiedTrigger.querySelector('.codicon') as HTMLElement | null
-    const icon = document.createElement('span')
-    icon.className = sourceIcon?.className || 'codicon codicon-unfold'
-    proxyButton.append(icon)
 
     const handlePointerDown = (event: MouseEvent) => {
       event.preventDefault()
@@ -832,6 +1059,7 @@ function syncInlineFoldProxies() {
       event.preventDefault()
       event.stopPropagation()
       modifiedTrigger.click()
+      safeRaf(() => scheduleEditorHeightSync())
     }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Enter' && event.key !== ' ')
@@ -839,47 +1067,48 @@ function syncInlineFoldProxies() {
       event.preventDefault()
       event.stopPropagation()
       modifiedTrigger.click()
+      safeRaf(() => scheduleEditorHeightSync())
     }
 
     proxyButton.addEventListener('mousedown', handlePointerDown)
     proxyButton.addEventListener('click', handleClick)
     proxyButton.addEventListener('keydown', handleKeyDown)
-    originalSlot.replaceChildren(proxyButton)
+    modifiedCenter.appendChild(proxyButton)
 
     inlineFoldProxyCleanups.push(() => {
       proxyButton.removeEventListener('mousedown', handlePointerDown)
       proxyButton.removeEventListener('click', handleClick)
       proxyButton.removeEventListener('keydown', handleKeyDown)
-      if (originalSlot.contains(proxyButton))
-        originalSlot.replaceChildren()
+      if (proxyButton.parentElement === modifiedCenter)
+        modifiedCenter.removeChild(proxyButton)
     })
   }
 }
 
-function scheduleEditorHeightSync() {
+function scheduleEditorHeightSync(allowDuringStreamingDiff = false) {
   if (deferredHeightSyncRafId != null)
     return
   deferredHeightSyncRafId = safeRaf(() => {
     deferredHeightSyncRafId = null
     safeRaf(() => {
       syncInlineFoldProxies()
-      if (isCollapsed.value)
-        return
-      if (isExpanded.value)
-        updateExpandedHeight()
-      else
-        updateCollapsedHeight()
+      syncEditorHostHeight(allowDuringStreamingDiff)
     })
   })
 }
 
 function applyCollapsedContainerHeight(container: HTMLElement, contentHeight: number, maxHeight: number) {
   const cappedHeight = Math.min(contentHeight, maxHeight)
-  const shouldScroll = contentHeight > maxHeight + PIXEL_EPSILON
   container.style.minHeight = '0px'
   container.style.height = `${Math.ceil(cappedHeight)}px`
   container.style.maxHeight = `${Math.ceil(maxHeight)}px`
-  container.style.overflow = shouldScroll ? 'auto' : 'hidden'
+  if (isDiff.value) {
+    container.style.overflow = 'hidden'
+  }
+  else {
+    const shouldScroll = contentHeight > maxHeight + PIXEL_EPSILON
+    container.style.overflow = shouldScroll ? 'auto' : 'hidden'
+  }
   return Math.ceil(cappedHeight)
 }
 
@@ -891,7 +1120,10 @@ function bindEditorHeightSync() {
     const originalEditor = diff?.getOriginalEditor?.()
     const modifiedEditor = diff?.getModifiedEditor?.()
 
-    const bind = (source: any, eventName: string) => {
+    const bind = (
+      source: MonacoEditorViewLike | null | undefined,
+      eventName: 'onDidContentSizeChange' | 'onDidLayoutChange',
+    ) => {
       try {
         const subscribe = source?.[eventName]
         if (typeof subscribe !== 'function')
@@ -916,22 +1148,22 @@ function bindEditorHeightSync() {
     bind(modifiedEditor, 'onDidContentSizeChange')
     bind(originalEditor, 'onDidLayoutChange')
     bind(modifiedEditor, 'onDidLayoutChange')
+    return
   }
-  else {
-    const editor = getEditorView()
-    try {
-      const disposable = editor?.onDidContentSizeChange?.(() => scheduleEditorHeightSync())
-      if (disposable)
-        editorHeightSyncDisposables.push(disposable)
-    }
-    catch {}
-    try {
-      const disposable = editor?.onDidLayoutChange?.(() => scheduleEditorHeightSync())
-      if (disposable)
-        editorHeightSyncDisposables.push(disposable)
-    }
-    catch {}
+
+  const editor = getEditorView()
+  try {
+    const disposable = editor?.onDidContentSizeChange?.(() => scheduleEditorHeightSync())
+    if (disposable)
+      editorHeightSyncDisposables.push(disposable)
   }
+  catch {}
+  try {
+    const disposable = editor?.onDidLayoutChange?.(() => scheduleEditorHeightSync())
+    if (disposable)
+      editorHeightSyncDisposables.push(disposable)
+  }
+  catch {}
 }
 
 function updateCollapsedHeight() {
@@ -943,6 +1175,11 @@ function updateCollapsedHeight() {
     const oldHeight = container.getBoundingClientRect().height
 
     const max = getMaxHeightValue()
+    const rectH = Math.ceil((container.getBoundingClientRect?.().height) || 0)
+    const estimatedDiffHeight = isDiff.value ? estimateDiffEditorContentHeight() : null
+    const hasVisibleCollapsedDiffSummary = isDiff.value && hasVisibleDiffHiddenLines(container)
+    if (!hasVisibleCollapsedDiffSummary)
+      lastStableCollapsedDiffHeight.value = null
     if (resumeGuardFrames > 0) {
       resumeGuardFrames--
       if (heightBeforeCollapse.value != null) {
@@ -951,10 +1188,24 @@ function updateCollapsedHeight() {
         return
       }
     }
-    const h0 = computeContentHeight()
+    const h0 = isDiff.value ? measureRenderedDiffHeight(container) : computeContentHeight()
     // 1) 有实时内容高度 -> 采用并记忆原始内容高度（未裁剪前），用于下一次恢复
     if (h0 != null && h0 > 0) {
-      const h = applyCollapsedContainerHeight(container, h0, max)
+      const shouldKeepLastStableCollapsedDiffHeight = lastStableCollapsedDiffHeight.value != null
+        && Date.now() < collapsedDiffSettleGuardUntil
+        && h0 >= max - PIXEL_EPSILON
+      const shouldKeepCurrentCollapsedDiffHeight = hasVisibleCollapsedDiffSummary
+        && rectH > 0
+        && rectH < max - PIXEL_EPSILON
+        && h0 >= max - PIXEL_EPSILON
+      const measuredHeight = shouldKeepLastStableCollapsedDiffHeight
+        ? lastStableCollapsedDiffHeight.value!
+        : shouldKeepCurrentCollapsedDiffHeight ? rectH : h0
+      const h = applyCollapsedContainerHeight(container, measuredHeight, max)
+      if (hasVisibleCollapsedDiffSummary && h < max - PIXEL_EPSILON) {
+        lastStableCollapsedDiffHeight.value = h
+        collapsedDiffSettleGuardUntil = Date.now() + 160
+      }
       adjustScrollAfterHeightChange(container, oldHeight, h)
       return
     }
@@ -966,10 +1217,29 @@ function updateCollapsedHeight() {
       return
     }
 
-    // 3) 使用当前 DOM 高度（不更新记忆值）
-    const rectH = Math.ceil((container.getBoundingClientRect?.().height) || 0)
-    if (rectH > 0) {
-      const h = applyCollapsedContainerHeight(container, rectH, max)
+    const stableFallbackHeight = hasVisibleCollapsedDiffSummary
+      ? rectH
+      : Math.max(
+          rectH,
+          estimatedDiffHeight != null && estimatedDiffHeight > 0 ? estimatedDiffHeight : 0,
+        )
+    // 3) 使用当前 DOM 高度或保守估算高度（不更新记忆值）
+    if (stableFallbackHeight > 0) {
+      const shouldKeepLastStableCollapsedDiffHeight = lastStableCollapsedDiffHeight.value != null
+        && Date.now() < collapsedDiffSettleGuardUntil
+        && stableFallbackHeight >= max - PIXEL_EPSILON
+      const shouldKeepCurrentCollapsedDiffHeight = hasVisibleCollapsedDiffSummary
+        && rectH > 0
+        && rectH < max - PIXEL_EPSILON
+        && stableFallbackHeight >= max - PIXEL_EPSILON
+      const fallbackHeight = shouldKeepLastStableCollapsedDiffHeight
+        ? lastStableCollapsedDiffHeight.value!
+        : shouldKeepCurrentCollapsedDiffHeight ? rectH : stableFallbackHeight
+      const h = applyCollapsedContainerHeight(container, fallbackHeight, max)
+      if (hasVisibleCollapsedDiffSummary && h < max - PIXEL_EPSILON) {
+        lastStableCollapsedDiffHeight.value = h
+        collapsedDiffSettleGuardUntil = Date.now() + 160
+      }
       adjustScrollAfterHeightChange(container, oldHeight, h)
       return
     }
@@ -980,7 +1250,7 @@ function updateCollapsedHeight() {
       const h = applyCollapsedContainerHeight(container, prev, max)
       adjustScrollAfterHeightChange(container, oldHeight, h)
     }
-    else {
+    else if (!isDiff.value) {
       // 实在没有历史高度，才退到 max（极少数首次场景）
       const h = applyCollapsedContainerHeight(container, max, max)
       adjustScrollAfterHeightChange(container, oldHeight, h)
@@ -1030,9 +1300,17 @@ watch(
       catch {}
     }
 
-    updateDiffCode(
+    const pair = resolveDiffRenderPair(
       String(originalCode ?? ''),
       String(updatedCode ?? ''),
+    )
+    if (props.loading === false) {
+      syncRuntimeMonacoOptions()
+      refreshDiffPresentation()
+    }
+    updateDiffCode(
+      pair.original,
+      pair.updated,
       monacoLanguage.value,
     )
 
@@ -1143,24 +1421,12 @@ const containerStyle = computed(() => {
     s.minWidth = min
   if (max)
     s.maxWidth = max
-  if (isDiff.value) {
-    s.color = 'var(--markstream-diff-shell-fg)'
-    s.borderColor = 'var(--markstream-diff-shell-border)'
-  }
-  else {
+  if (!isDiff.value) {
     s.color = 'var(--vscode-editor-foreground, var(--markstream-code-fallback-fg))'
     s.backgroundColor = 'var(--vscode-editor-background, var(--markstream-code-fallback-bg))'
     s.borderColor = 'var(--markstream-code-border-color)'
   }
   return s
-})
-const headerStyle = computed<Record<string, string> | undefined>(() => {
-  if (isDiff.value)
-    return undefined
-  return {
-    color: 'var(--vscode-editor-foreground, var(--markstream-code-fallback-fg))',
-    backgroundColor: 'var(--vscode-editor-background, var(--markstream-code-fallback-bg))',
-  }
 })
 const tooltipsEnabled = computed(() => props.showTooltips !== false)
 
@@ -1194,36 +1460,6 @@ function resolveTooltipTarget(e: Event) {
   return btn
 }
 
-type TooltipPlacement = 'top' | 'bottom' | 'left' | 'right'
-function onBtnHover(e: Event, text: string, place: TooltipPlacement = 'top') {
-  if (!tooltipsEnabled.value)
-    return
-  const target = resolveTooltipTarget(e)
-  if (!target)
-    return
-  const ev = e as MouseEvent
-  const origin = ev?.clientX != null && ev?.clientY != null ? { x: ev.clientX, y: ev.clientY } : undefined
-  showTooltipForAnchor(target, text, place, false, origin, props.isDark)
-}
-
-function onBtnLeave() {
-  if (!tooltipsEnabled.value)
-    return
-  hideTooltip()
-}
-
-function onCopyHover(e: Event) {
-  if (!tooltipsEnabled.value)
-    return
-  const target = resolveTooltipTarget(e)
-  if (!target)
-    return
-  const txt = copyText.value ? (t('common.copied') || 'Copied') : (t('common.copy') || 'Copy')
-  const ev = e as MouseEvent
-  const origin = ev?.clientX != null && ev?.clientY != null ? { x: ev.clientX, y: ev.clientY } : undefined
-  showTooltipForAnchor(target, txt, 'top', false, origin, props.isDark)
-}
-
 function toggleExpand(e?: Event) {
   isExpanded.value = !isExpanded.value
 
@@ -1247,13 +1483,13 @@ function toggleExpand(e?: Event) {
     setAutomaticLayout(true)
     container.style.maxHeight = 'none'
     container.style.overflow = 'visible'
-    updateExpandedHeight()
+    syncEditorHostHeight(true)
   }
   else {
     stopExpandAutoResize()
     setAutomaticLayout(false)
-    container.style.overflow = 'auto'
-    updateCollapsedHeight()
+    container.style.overflow = isDiff.value ? 'hidden' : 'auto'
+    syncEditorHostHeight(true)
   }
 }
 
@@ -1281,10 +1517,7 @@ function toggleHeaderCollapse() {
     catch {}
     resumeGuardFrames = 2
     safeRaf(() => {
-      if (isExpanded.value)
-        updateExpandedHeight()
-      else
-        updateCollapsedHeight()
+      syncEditorHostHeight(true)
     })
   }
 }
@@ -1298,9 +1531,8 @@ watch(
     if (!(typeof size === 'number' && Number.isFinite(size) && size > 0))
       return
     editor.updateOptions({ fontSize: size })
-    // In automaticLayout mode, no manual height updates are needed
-    if (isExpanded.value && !isCollapsed.value)
-      updateExpandedHeight()
+    if (!isCollapsed.value)
+      syncEditorHostHeight(true)
   },
   { flush: 'post', immediate: false },
 )
@@ -1352,17 +1584,23 @@ function resetEditorHost(el: HTMLElement) {
 }
 
 async function runEditorCreation(el: HTMLElement) {
-  if (!createEditor)
+  if (!createEditor || isUnmounted)
     return
 
   clearEditorHeightSyncBindings()
   clearInlineFoldProxies()
   resetEditorHost(el)
+  if (isUnmounted)
+    return
 
   if (isDiff.value) {
     safeClean()
+    const pair = resolveDiffRenderPair(
+      String(props.node.originalCode ?? ''),
+      String(props.node.updatedCode ?? ''),
+    )
     if (createDiffEditor) {
-      await createDiffEditor(el as HTMLElement, String(props.node.originalCode ?? ''), String(props.node.updatedCode ?? ''), monacoLanguage.value)
+      await createDiffEditor(el as HTMLElement, pair.original, pair.updated, monacoLanguage.value)
     }
     else {
       await createEditor(el as HTMLElement, props.node.code, monacoLanguage.value)
@@ -1371,6 +1609,8 @@ async function runEditorCreation(el: HTMLElement) {
   else {
     await createEditor(el as HTMLElement, props.node.code, monacoLanguage.value)
   }
+  if (isUnmounted)
+    return
 
   const editor = isDiff.value ? getDiffEditorView() : getEditorView()
   if (typeof props.monacoOptions?.fontSize === 'number') {
@@ -1391,19 +1631,22 @@ async function runEditorCreation(el: HTMLElement) {
   }
 
   if (!isExpanded.value && !isCollapsed.value)
-    updateCollapsedHeight()
+    syncEditorHostHeight(false)
 
   if (props.loading === false) {
     await nextTick()
+    if (isUnmounted)
+      return
     safeRaf(() => {
-      if (isExpanded.value && !isCollapsed.value)
-        updateExpandedHeight()
-      else if (!isCollapsed.value)
-        updateCollapsedHeight()
+      if (isUnmounted)
+        return
+      syncEditorHostHeight(false)
     })
   }
 
   await nextTick()
+  if (isUnmounted)
+    return
   editorMounted.value = true
   bindEditorHeightSync()
   syncEditorCssVars()
@@ -1413,7 +1656,7 @@ async function runEditorCreation(el: HTMLElement) {
 }
 
 function ensureEditorCreation(el: HTMLElement) {
-  if (!createEditor)
+  if (!createEditor || isUnmounted)
     return null
   if (createEditorPromise)
     return createEditorPromise
@@ -1422,13 +1665,15 @@ function ensureEditorCreation(el: HTMLElement) {
 
   editorCreated.value = true
   const pending = (async () => {
-    await runEditorCreation(el)
+    await withMonacoPassiveTouchListeners(() => runEditorCreation(el))
   })()
 
-  createEditorPromise = pending.finally(() => {
-    createEditorPromise = null
+  const currentPromise = pending.finally(() => {
+    if (createEditorPromise === currentPromise)
+      createEditorPromise = null
   })
-  return createEditorPromise
+  createEditorPromise = currentPromise
+  return currentPromise
 }
 
 // 延迟创建编辑器：仅在可见且准备就绪时创建，避免无意义的初始化
@@ -1451,8 +1696,9 @@ const stopCreateEditorWatch = watch(
     try {
       await creation
     }
-    catch {
+    catch (error) {
       // Keep the `<pre>` fallback if Monaco fails to mount for this block.
+      warnCodeBlockDev('Failed to mount Monaco editor', error)
       editorMounted.value = false
     }
 
@@ -1479,33 +1725,59 @@ watch(
       return
     if (!viewportReady.value)
       return
+    const pendingCreation = createEditorPromise
+    if (pendingCreation) {
+      try {
+        await pendingCreation
+      }
+      catch {}
+      if (isUnmounted || !codeEditor.value)
+        return
+    }
 
     try {
       editorMounted.value = false
       editorCreated.value = false
-      createEditorPromise = null
       clearEditorHeightSyncBindings()
       clearInlineFoldProxies()
       safeClean()
       await nextTick()
       await ensureEditorCreation(codeEditor.value as HTMLElement)
     }
-    catch {
+    catch (error) {
+      warnCodeBlockDev('Failed to recreate Monaco editor after code block kind changed', error)
       // Keep fallback rendering if recreation fails.
       editorMounted.value = false
     }
   },
 )
 
-function getPreferredColorScheme() {
+function isPairedTheme(t: unknown): t is { light: CodeBlockMonacoTheme, dark: CodeBlockMonacoTheme } {
+  return !!t && typeof t === 'object' && 'light' in t && 'dark' in t
+}
+
+function getPreferredColorScheme(): CodeBlockMonacoTheme | undefined {
+  // Unified theme prop takes precedence
+  if (props.theme !== undefined) {
+    const t = props.theme
+    if (isPairedTheme(t))
+      return props.isDark ? t.dark : t.light
+    // Fixed theme — always this theme regardless of isDark
+    return t as CodeBlockMonacoTheme
+  }
+  // Backward compat: darkTheme / lightTheme
   return props.isDark ? props.darkTheme : props.lightTheme
 }
 
-function getThemeName(theme: any) {
+function isFixedTheme(): boolean {
+  return props.theme !== undefined && !isPairedTheme(props.theme)
+}
+
+function getThemeName(theme: CodeBlockMonacoTheme | null | undefined) {
   if (typeof theme === 'string')
     return theme
   if (theme && typeof theme === 'object' && 'name' in theme)
-    return String((theme as any).name)
+    return String(theme.name)
   return null
 }
 
@@ -1513,6 +1785,11 @@ function resolveRequestedTheme() {
   const preferred = getPreferredColorScheme()
   const explicit = resolvedMonacoOptions.value?.theme
   const requested = preferred ?? explicit
+
+  // Object themes are self-contained — trust them directly, skip availability check
+  if (requested != null && typeof requested === 'object')
+    return requested
+
   const availableThemes = Array.isArray(props.themes) ? props.themes : []
   if (!availableThemes.length || requested == null)
     return requested
@@ -1551,10 +1828,18 @@ function themeUpdate() {
 
   void scheduleGlobalMonacoTheme(setTheme, themeToSet)
     .then(syncPresentation)
-    .catch(() => {})
+    .catch((error) => {
+      warnCodeBlockDev('Failed to apply Monaco theme', error)
+    })
 }
 
-function themeLooksDark(theme: any) {
+function themeLooksDark(theme: CodeBlockMonacoTheme | null | undefined) {
+  // For object themes, try to detect from editor.background luminance
+  if (theme && typeof theme === 'object' && theme.colors?.['editor.background']) {
+    const lum = getColorLuminance(theme.colors['editor.background'])
+    if (lum != null)
+      return lum < 128
+  }
   const themeName = getThemeName(theme) ?? ''
   const normalized = themeName.toLowerCase()
   if (!normalized)
@@ -1588,21 +1873,31 @@ function themeLooksDark(theme: any) {
     && !lightTokens.some(token => normalized.includes(token))
 }
 
-const resolvedChromeIsDark = computed(() => themeLooksDark(resolveRequestedTheme()))
+/**
+ * Whether the editor surface (Monaco area) is dark.
+ * For fixed themes: detected from theme name or object luminance.
+ * For paired themes: follows page isDark.
+ */
+const editorSurfaceIsDark = computed(() => {
+  if (isFixedTheme())
+    return themeLooksDark(resolveRequestedTheme())
+  // Paired or default: follow page theme
+  return !!props.isDark
+})
 
 const effectiveDiffAppearance = computed<'light' | 'dark'>(() => {
   if (!isDiff.value)
-    return resolvedChromeIsDark.value ? 'dark' : 'light'
+    return editorSurfaceIsDark.value ? 'dark' : 'light'
 
   const explicit = resolvedMonacoOptions.value?.diffAppearance
   if (explicit === 'light' || explicit === 'dark')
     return explicit
 
-  return props.isDark ? 'dark' : 'light'
+  return editorSurfaceIsDark.value ? 'dark' : 'light'
 })
 
 const resolvedSurfaceIsDark = computed(() =>
-  isDiff.value ? effectiveDiffAppearance.value === 'dark' : resolvedChromeIsDark.value,
+  isDiff.value ? effectiveDiffAppearance.value === 'dark' : editorSurfaceIsDark.value,
 )
 
 function buildRuntimeMonacoOptions() {
@@ -1616,7 +1911,7 @@ function buildRuntimeMonacoOptions() {
     onThemeChange() {
       syncEditorCssVars()
     },
-  } as Record<string, any>
+  } as MonacoRuntimeOptions
 }
 
 function syncRuntimeMonacoOptions() {
@@ -1637,8 +1932,11 @@ function syncRuntimeMonacoOptions() {
 const monacoStructuralSignature = computed(() => JSON.stringify({
   diffLineStyle: resolvedMonacoOptions.value?.diffLineStyle ?? 'background',
   diffUnchangedRegionStyle: resolvedMonacoOptions.value?.diffUnchangedRegionStyle ?? 'line-info',
-  diffHideUnchangedRegions: resolvedMonacoOptions.value?.diffHideUnchangedRegions ?? true,
+  diffHideUnchangedRegions: props.monacoOptions?.diffHideUnchangedRegions === undefined
+    ? { ...defaultDiffHideUnchangedRegions }
+    : resolveDiffHideUnchangedRegionsOption(props.monacoOptions.diffHideUnchangedRegions),
   renderSideBySide: resolvedMonacoOptions.value?.renderSideBySide ?? true,
+  useInlineViewWhenSpaceIsLimited: resolvedMonacoOptions.value?.useInlineViewWhenSpaceIsLimited ?? true,
   enableSplitViewResizing: resolvedMonacoOptions.value?.enableSplitViewResizing ?? true,
   ignoreTrimWhitespace: resolvedMonacoOptions.value?.ignoreTrimWhitespace ?? true,
   originalEditable: resolvedMonacoOptions.value?.originalEditable ?? false,
@@ -1660,10 +1958,7 @@ watch(
     if (typeof applying === 'number' && Number.isFinite(applying) && applying > 0) {
       ed?.updateOptions?.({ fontSize: applying })
     }
-    if (isExpanded.value && !isCollapsed.value)
-      updateExpandedHeight()
-    else if (!isCollapsed.value)
-      updateCollapsedHeight()
+    syncEditorHostHeight(false)
   },
   { deep: true },
 )
@@ -1692,27 +1987,35 @@ watch(
       return
     if (props.stream === false && props.loading !== false)
       return
+    const pendingCreation = createEditorPromise
+    if (pendingCreation) {
+      try {
+        await pendingCreation
+      }
+      catch {}
+      if (isUnmounted || !codeEditor.value)
+        return
+    }
 
     try {
       editorMounted.value = false
       editorCreated.value = false
-      createEditorPromise = null
       clearEditorHeightSyncBindings()
       clearInlineFoldProxies()
       safeClean()
       await nextTick()
       await ensureEditorCreation(codeEditor.value as HTMLElement)
     }
-    catch {
+    catch (error) {
+      warnCodeBlockDev('Failed to recreate Monaco editor after Monaco options changed', error)
       editorMounted.value = false
     }
   },
   { flush: 'post' },
 )
 
-// 当 loading 变为 false 时：计算并缓存一次展开高度，随后停止观察
-
-const stopLoadingWatch = watch(
+// 当 loading 变为 false 时：计算并缓存一次展开高度
+watch(
   () => [props.loading, viewportReady.value],
   async ([loaded, visible], previous) => {
     if (!visible)
@@ -1724,36 +2027,30 @@ const stopLoadingWatch = watch(
     await nextTick()
     safeRaf(() => {
       void (async () => {
-        if (loadingJustFinished && editorCreated.value) {
-          if (isDiff.value && codeEditor.value) {
-            const pendingCreation = createEditorPromise
-            if (pendingCreation) {
-              try {
-                await pendingCreation
+        try {
+          if (loadingJustFinished && editorCreated.value) {
+            if (isDiff.value && codeEditor.value) {
+              const pendingCreation = createEditorPromise
+              if (pendingCreation) {
+                try {
+                  await pendingCreation
+                }
+                catch {}
               }
-              catch {}
+              syncRuntimeMonacoOptions()
+              refreshDiffPresentation()
+              syncInlineFoldProxies()
+              refreshDiffStats()
             }
-            editorMounted.value = false
-            editorCreated.value = false
-            createEditorPromise = null
-            clearEditorHeightSyncBindings()
-            clearInlineFoldProxies()
-            safeClean()
-            codeEditor.value.replaceChildren()
-            await nextTick()
-            await ensureEditorCreation(codeEditor.value as HTMLElement)
+            else {
+              updateCode(String(props.node.code ?? ''), monacoLanguage.value)
+            }
           }
-          else {
-            updateCode(String(props.node.code ?? ''), monacoLanguage.value)
-          }
+          syncEditorHostHeight(false)
         }
-        if (!isCollapsed.value) {
-          if (isExpanded.value)
-            updateExpandedHeight()
-          else
-            updateCollapsedHeight()
+        catch (error) {
+          warnCodeBlockDev('Failed to refresh Monaco editor after streaming settled', error)
         }
-        stopLoadingWatch()
       })()
     })
     stopExpandAutoResize()
@@ -1787,245 +2084,149 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PreCodeNode v-if="usePreCodeRender" :node="(node as any)" :loading="props.loading" />
+  <PreCodeNode v-if="usePreCodeRender" :node="props.node" :loading="props.loading" />
   <div
     v-else
     ref="container"
     :style="containerStyle"
-    class="code-block-container my-4 rounded-lg border overflow-hidden shadow-sm"
+    class="code-block-container rounded-lg border"
     data-markstream-code-block="1"
     :data-markstream-enhanced="editorMounted && !usePreCodeRender ? 'true' : 'false'"
     :class="[
-      { 'is-rendering': props.loading, 'is-dark': resolvedSurfaceIsDark, 'is-diff': isDiff, 'is-plain-text': isPlainTextLanguage },
+      { 'dark': props.isDark, 'is-rendering': props.loading, 'is-dark': resolvedSurfaceIsDark, 'is-diff': isDiff, 'is-plain-text': isPlainTextLanguage },
     ]"
   >
-    <!-- Configurable header area: consumers may override via named slots -->
-    <div
-      v-if="props.showHeader"
-      class="code-block-header flex justify-between items-center px-4 py-2.5 border-b border-gray-400/5"
-      :style="headerStyle"
-    >
-      <!-- left slot / fallback language label -->
-      <slot name="header-left">
-        <div class="code-header-main">
-          <span class="icon-slot h-4 w-4 flex-shrink-0" v-html="languageIcon" />
-          <div class="code-header-copy">
-            <div class="code-header-title">
-              {{ headerTitle }}
-            </div>
-            <div v-if="headerCaption" class="code-header-caption">
-              {{ headerCaption }}
-            </div>
-          </div>
-        </div>
-      </slot>
-
-      <!-- right slot / fallback action buttons -->
-      <slot name="header-right">
-        <div class="code-header-actions">
-          <div
-            v-if="isDiff"
-            class="code-diff-stats"
-            :aria-label="diffStatsAriaLabel"
-          >
-            <span class="code-diff-stat removed">-{{ diffStats.removed }}</span>
-            <span class="code-diff-stat added">+{{ diffStats.added }}</span>
-          </div>
-          <button
-            v-if="props.showCollapseButton"
-            type="button"
-            class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-            :aria-pressed="isCollapsed"
-            @click="toggleHeaderCollapse"
-            @mouseenter="onBtnHover($event, isCollapsed ? (t('common.expand') || 'Expand') : (t('common.collapse') || 'Collapse'))"
-            @focus="onBtnHover($event, isCollapsed ? (t('common.expand') || 'Expand') : (t('common.collapse') || 'Collapse'))"
-            @mouseleave="onBtnLeave"
-            @blur="onBtnLeave"
-          >
-            <svg :style="{ rotate: isCollapsed ? '0deg' : '90deg' }" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m9 18l6-6l-6-6" /></svg>
-          </button>
-          <template v-if="props.showFontSizeButtons && props.enableFontSizeControl">
-            <button
-              type="button"
-              class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-              :disabled="Number.isFinite(codeFontSize) ? codeFontSize <= codeFontMin : false"
-              @click="decreaseCodeFont()"
-              @mouseenter="onBtnHover($event, t('common.decrease') || 'Decrease')"
-              @focus="onBtnHover($event, t('common.decrease') || 'Decrease')"
-              @mouseleave="onBtnLeave"
-              @blur="onBtnLeave"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14" /></svg>
-            </button>
-            <button
-              type="button"
-              class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-              :disabled="!fontBaselineReady || codeFontSize === defaultCodeFontSize"
-              @click="resetCodeFont()"
-              @mouseenter="onBtnHover($event, t('common.reset') || 'Reset')"
-              @focus="onBtnHover($event, t('common.reset') || 'Reset')"
-              @mouseleave="onBtnLeave"
-              @blur="onBtnLeave"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9a9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></g></svg>
-            </button>
-            <button
-              type="button"
-              class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-              :disabled="Number.isFinite(codeFontSize) ? codeFontSize >= codeFontMax : false"
-              @click="increaseCodeFont()"
-              @mouseenter="onBtnHover($event, t('common.increase') || 'Increase')"
-              @focus="onBtnHover($event, t('common.increase') || 'Increase')"
-              @mouseleave="onBtnLeave"
-              @blur="onBtnLeave"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14m-7-7v14" /></svg>
-            </button>
-          </template>
-
-          <button
-            v-if="props.showCopyButton"
-            type="button"
-            class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-            :aria-label="copyText ? (t('common.copied') || 'Copied') : (t('common.copy') || 'Copy')"
-            @click="copy"
-            @mouseenter="onCopyHover($event)"
-            @focus="onCopyHover($event)"
-            @mouseleave="onBtnLeave"
-            @blur="onBtnLeave"
-          >
-            <svg v-if="!copyText" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2" ry="2" /><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" /></g></svg>
-            <svg v-else xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 6L9 17l-5-5" /></svg>
-          </button>
-
-          <button
-            v-if="props.showExpandButton"
-            type="button"
-            class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-            :aria-pressed="isExpanded"
-            @click="toggleExpand($event)"
-            @mouseenter="onBtnHover($event, isExpanded ? (t('common.collapse') || 'Collapse') : (t('common.expand') || 'Expand'))"
-            @focus="onBtnHover($event, isExpanded ? (t('common.collapse') || 'Collapse') : (t('common.expand') || 'Expand'))"
-            @mouseleave="onBtnLeave"
-            @blur="onBtnLeave"
-          >
-            <svg v-if="isExpanded" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m14 10l7-7m-1 7h-6V4M3 21l7-7m-6 0h6v6" /></svg>
-            <svg v-else xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" width="1em" height="1em" viewBox="0 0 24 24" class="w-3 h-3"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 3h6v6m0-6l-7 7M3 21l7-7m-1 7H3v-6" /></svg>
-          </button>
-
-          <button
-            v-if="isPreviewable && props.showPreviewButton"
-            type="button"
-            class="code-action-btn p-2 text-xs rounded-md transition-colors hover:bg-[var(--vscode-editor-selectionBackground)]"
-            :aria-label="t('common.preview') || 'Preview'"
-            @click="previewCode"
-            @mouseenter="onBtnHover($event, t('common.preview') || 'Preview')"
-            @focus="onBtnHover($event, t('common.preview') || 'Preview')"
-            @mouseleave="onBtnLeave"
-            @blur="onBtnLeave"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><!-- Icon from Freehand free icons by Streamline - https://creativecommons.org/licenses/by/4.0/ --><g fill="currentColor" fill-rule="evenodd" clip-rule="evenodd"><path d="M23.628 7.41c-.12-1.172-.08-3.583-.9-4.233c-1.921-1.51-6.143-1.11-8.815-1.19c-3.481-.15-7.193.14-10.625.24a.34.34 0 0 0 0 .67c3.472-.05 7.074-.29 10.575-.09c2.471.15 6.653-.14 8.254 1.16c.4.33.41 2.732.49 3.582a42 42 0 0 1 .08 9.005a13.8 13.8 0 0 1-.45 3.001c-2.42 1.4-19.69 2.381-20.72.55a21 21 0 0 1-.65-4.632a41.5 41.5 0 0 1 .12-7.964c.08 0 7.334.33 12.586.24c2.331 0 4.682-.13 6.764-.21a.33.33 0 0 0 0-.66c-7.714-.16-12.897-.43-19.31.05c.11-1.38.48-3.922.38-4.002a.3.3 0 0 0-.42 0c-.37.41-.29 1.77-.36 2.251s-.14 1.07-.2 1.6a45 45 0 0 0-.36 8.645a21.8 21.8 0 0 0 .66 5.002c1.46 2.702 17.248 1.461 20.95.43c1.45-.4 1.69-.8 1.871-1.95c.575-3.809.602-7.68.08-11.496" /><path d="M4.528 5.237a.84.84 0 0 0-.21-1c-.77-.41-1.71.39-1 1.1a.83.83 0 0 0 1.21-.1m2.632-.25c.14-.14.19-.84-.2-1c-.77-.41-1.71.39-1 1.09a.82.82 0 0 0 1.2-.09m2.88 0a.83.83 0 0 0-.21-1c-.77-.41-1.71.39-1 1.09a.82.82 0 0 0 1.21-.09m-4.29 8.735c0 .08.23 2.471.31 2.561a.371.371 0 0 0 .63-.14c0-.09 0 0 .15-1.72a10 10 0 0 0-.11-2.232a5.3 5.3 0 0 1-.26-1.37a.3.3 0 0 0-.54-.24a6.8 6.8 0 0 0-.2 2.33c-1.281-.38-1.121.13-1.131-.42a15 15 0 0 0-.19-1.93c-.16-.17-.36-.17-.51.14a20 20 0 0 0-.43 3.471c.04.773.18 1.536.42 2.272c.26.4.7.22.7-.1c0-.09-.16-.09 0-1.862c.06-1.18-.23-.3 1.16-.76m5.033-2.552c.32-.07.41-.28.39-.37c0-.55-3.322-.34-3.462-.24s-.2.18-.18.28s0 .11 0 .16a3.8 3.8 0 0 0 1.591.361v.82a15 15 0 0 0-.13 3.132c0 .2-.09.94.17 1.16a.34.34 0 0 0 .48 0c.125-.35.196-.718.21-1.09a8 8 0 0 0 .14-3.232c0-.13.05-.7-.1-.89a8 8 0 0 0 .89-.09m5.544-.181a.69.69 0 0 0-.89-.44a2.8 2.8 0 0 0-1.252 1.001a2.3 2.3 0 0 0-.41-.83a1 1 0 0 0-1.6.27a7 7 0 0 0-.35 2.07c0 .571 0 2.642.06 2.762c.14 1.09 1 .51.63.13a17.6 17.6 0 0 1 .38-3.962c.32-1.18.32.2.39.51s.11 1.081.73 1.081s.48-.93 1.401-1.78q.075 1.345 0 2.69a15 15 0 0 0 0 1.811a.34.34 0 0 0 .68 0q.112-.861.11-1.73a16.7 16.7 0 0 0 .12-3.582m1.441-.201c-.05.16-.3 3.002-.31 3.202a6.3 6.3 0 0 0 .21 1.741c.33 1 1.21 1.07 2.291.82a3.7 3.7 0 0 0 1.14-.23c.21-.22.10-.59-.41-.64q-.817.096-1.64.07c-.44-.07-.34 0-.67-4.442q.015-.185 0-.37a.316.316 0 0 0-.23-.38a.316.316 0 0 0-.38.23" /></g></svg>
-          </button>
-        </div>
-      </slot>
-    </div>
-    <div v-show="!isCollapsed && (stream ? true : !loading)" class="code-editor-layer">
-      <div
-        ref="codeEditor"
-        class="code-editor-container"
-        :class="[stream ? '' : 'code-height-placeholder', { 'is-hidden': showPreWhileMonacoLoads }]"
-      />
-      <PreCodeNode
-        v-if="showPreWhileMonacoLoads"
-        class="code-pre-fallback"
-        :class="{ 'is-wrap': preFallbackWrap }"
-        :style="preFallbackStyle"
-        :node="(node as any)"
-      />
-    </div>
-    <HtmlPreviewFrame
-      v-if="showInlinePreview && !hasPreviewListener && isPreviewable && codeLanguage === 'html'"
-      :code="node.code"
+    <CodeBlockShell
+      :show-header="props.showHeader"
+      :show-collapse-button="props.showCollapseButton"
+      :show-font-size-buttons="props.showFontSizeButtons"
+      :enable-font-size-control="props.enableFontSizeControl"
+      :show-copy-button="props.showCopyButton"
+      :show-expand-button="props.showExpandButton"
+      :show-preview-button="props.showPreviewButton"
+      :show-tooltips="props.showTooltips"
       :is-dark="props.isDark"
-      :on-close="() => (showInlinePreview = false)"
-    />
-    <!-- Loading placeholder (non-streaming mode) can be overridden via slot -->
-    <div v-show="!stream && loading" class="code-loading-placeholder">
-      <slot name="loading" :loading="loading" :stream="stream">
-        <div class="loading-skeleton">
-          <div class="skeleton-line" />
-          <div class="skeleton-line" />
-          <div class="skeleton-line short" />
-        </div>
-      </slot>
-    </div>
-    <!-- Teleported tooltip removed: using singleton composable instead -->
-    <!-- Copy status for screen readers -->
-    <span class="sr-only" aria-live="polite" role="status">{{ copyText ? t('common.copied') || 'Copied' : '' }}</span>
+      :loading="props.loading"
+      :stream="stream"
+      :is-collapsed="isCollapsed"
+      :is-expanded="isExpanded"
+      :copy-text="copyText"
+      :is-previewable="isPreviewable"
+      :code-font-size="codeFontSize"
+      :code-font-min="codeFontMin"
+      :code-font-max="codeFontMax"
+      :default-code-font-size="defaultCodeFontSize"
+      :font-baseline-ready="fontBaselineReady"
+      :diff-stats="isDiff ? diffStats : null"
+      :diff-stats-aria-label="diffStatsAriaLabel"
+      @toggle-collapse="toggleHeaderCollapse"
+      @decrease-font="decreaseCodeFont"
+      @reset-font="resetCodeFont"
+      @increase-font="increaseCodeFont"
+      @copy="copy"
+      @toggle-expand="toggleExpand"
+      @preview="previewCode"
+    >
+      <template #header-left>
+        <slot name="header-left">
+          <div class="code-header-main">
+            <span class="icon-slot h-4 w-4 flex-shrink-0" v-html="languageIcon" />
+            <div class="code-header-copy">
+              <div class="code-header-title">
+                {{ headerTitle }}
+              </div>
+              <div v-if="headerCaption" class="code-header-caption">
+                {{ headerCaption }}
+              </div>
+            </div>
+          </div>
+        </slot>
+      </template>
+      <template v-if="$slots['header-right']" #header-right>
+        <slot name="header-right" />
+      </template>
+
+      <!-- Monaco editor layer -->
+      <div v-show="!isCollapsed && (stream ? true : !loading)" class="code-editor-layer">
+        <div
+          ref="codeEditor"
+          class="code-editor-container"
+          :class="[stream ? '' : 'code-height-placeholder', { 'is-hidden': showPreWhileMonacoLoads }]"
+          :style="codeEditorContainerStyle"
+        />
+        <PreCodeNode
+          v-if="showPreWhileMonacoLoads"
+          class="code-pre-fallback"
+          :class="{ 'is-wrap': preFallbackWrap }"
+          :style="preFallbackStyle"
+          :node="props.node"
+        />
+      </div>
+      <HtmlPreviewFrame
+        v-if="showInlinePreview && !hasPreviewListener && isPreviewable && codeLanguage === 'html'"
+        :code="props.node.code"
+        :is-dark="props.isDark"
+        :on-close="() => (showInlinePreview = false)"
+      />
+
+      <template #loading>
+        <slot name="loading" :loading="loading" :stream="stream">
+          <div class="loading-skeleton">
+            <div class="skeleton-line" />
+            <div class="skeleton-line" />
+            <div class="skeleton-line short" />
+          </div>
+        </slot>
+      </template>
+    </CodeBlockShell>
   </div>
 </template>
 
 <style scoped>
 .code-block-container {
-  contain: content;
-    /* 新增：显著减少离屏 codeblock 的布局/绘制与样式计算 */
-  content-visibility: auto;
-  contain-intrinsic-size: 320px 180px;
-  container-type: inline-size;
-  --markstream-code-fallback-bg: #ffffff;
-  --markstream-code-fallback-fg: #111827;
-  --markstream-code-border-color: rgb(229 231 235);
+  --markstream-code-fallback-bg: var(--code-bg);
+  --markstream-code-fallback-fg: var(--code-fg);
+  --markstream-code-border-color: var(--code-border);
   --vscode-editor-selectionBackground: var(--markstream-code-fallback-selection-bg);
-  --markstream-code-fallback-selection-bg: rgba(0, 0, 0, 0.06);
-  --markstream-diff-frame-border: rgb(203 213 225 / 0.56);
-  --markstream-diff-frame-shadow: 0 16px 40px -32px rgb(15 23 42 / 0.18);
-  --markstream-diff-shell-fg: #0f172a;
-  --markstream-diff-shell-muted: #64748b;
-  --markstream-diff-shell-border: rgb(148 163 184 / 0.18);
-  --markstream-diff-shell-shadow: 0 30px 70px -48px rgb(15 23 42 / 0.42);
-  --markstream-diff-shell-bg: radial-gradient(
-      circle at top center,
-      rgb(255 255 255 / 0.9),
-      transparent 55%
-    ),
-    linear-gradient(180deg, #fffdfa 0%, #fbfcfe 100%);
-  --markstream-diff-header-border: rgb(226 232 240 / 0.92);
-  --markstream-diff-stage-bg: radial-gradient(
-      circle at top center,
-      rgb(255 255 255 / 0.95),
-      transparent 60%
-    ),
-    linear-gradient(180deg, #fcfdff 0%, #f6f8fb 100%);
-  --markstream-diff-editor-bg: #ffffff;
-  --markstream-diff-editor-fg: #435266;
-  --markstream-diff-unchanged-fg: lab(36.247 0.0071872 -0.000424832);
-  --markstream-diff-unchanged-bg: lab(95.9989 0.0180531 -0.0010643);
-  --markstream-diff-unchanged-divider: rgb(255 255 255 / 0.94);
-  --markstream-diff-focus: rgb(14 165 233 / 0.42);
-  --markstream-diff-widget-shadow: rgb(15 23 42 / 0.26);
-  --markstream-diff-action-hover: rgb(15 23 42 / 0.06);
-  --markstream-diff-panel-bg: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
-  --markstream-diff-panel-bg-soft: #ffffff;
-  --markstream-diff-panel-bg-strong: #ffffff;
-  --markstream-diff-panel-border: rgb(226 232 240 / 0.3);
-  --markstream-diff-pane-divider: rgb(226 232 240 / 0.42);
+  --markstream-code-fallback-selection-bg: var(--code-selection-bg);
+  --markstream-diff-frame-border: var(--code-border);
+  --markstream-diff-frame-shadow: 0 16px 40px -32px hsl(var(--ms-foreground) / 0.18);
+  --markstream-diff-shell-fg: hsl(var(--ms-foreground));
+  --markstream-diff-shell-muted: hsl(var(--ms-muted-foreground));
+  --markstream-diff-shell-border: var(--code-border);
+  --markstream-diff-shell-shadow: var(--ms-shadow-subtle);
+  --markstream-diff-shell-bg: var(--code-bg);
+  --markstream-diff-header-border: hsl(var(--ms-border) / 0.92);
+  --markstream-diff-editor-bg: var(--code-bg);
+  --markstream-diff-editor-fg: hsl(var(--ms-foreground));
+  --markstream-diff-unchanged-fg: hsl(var(--ms-foreground));
+  --markstream-diff-unchanged-bg: hsl(var(--ms-muted));
+  --markstream-diff-unchanged-divider: hsl(var(--ms-background) / 0.94);
+  --markstream-diff-focus: var(--focus-ring);
+  --markstream-diff-widget-shadow: hsl(var(--ms-foreground) / 0.26);
+  --markstream-diff-action-hover: var(--code-action-hover-bg);
+  --markstream-diff-panel-bg: linear-gradient(180deg, var(--code-bg) 0%, hsl(var(--ms-muted)) 100%);
+  --markstream-diff-panel-bg-soft: var(--code-bg);
+  --markstream-diff-panel-bg-strong: var(--code-bg);
+  --markstream-diff-panel-border: hsl(var(--ms-border) / 0.3);
+  --markstream-diff-pane-divider: hsl(var(--ms-border) / 0.42);
   --markstream-diff-gutter-bg: transparent;
   --markstream-diff-gutter-guide: transparent;
-  --markstream-diff-gutter-gap: 16px;
-  --markstream-diff-line-number: rgb(82 82 82 / 0.88);
-  --markstream-diff-line-number-active: rgb(82 82 82 / 0.88);
-  --markstream-diff-added-fg: #14b8a6;
-  --markstream-diff-removed-fg: #ff3658;
-  --markstream-diff-added-line: rgb(232 249 245 / 0.98);
-  --markstream-diff-removed-line: rgb(255 241 241 / 0.98);
-  --markstream-diff-added-inline: rgb(197 245 219 / 0.96);
-  --markstream-diff-removed-inline: rgb(255 215 217 / 0.92);
+  --markstream-diff-gutter-gap: 8px;
+  --markstream-diff-line-number: var(--code-line-number);
+  --markstream-diff-line-number-active: var(--code-line-number);
+  --markstream-diff-added-fg: var(--diff-added-fg);
+  --markstream-diff-removed-fg: var(--diff-removed-fg);
+  --markstream-diff-added-line: var(--diff-added-bg);
+  --markstream-diff-removed-line: var(--diff-removed-bg);
+  --markstream-diff-added-inline: var(--diff-added-inline-bg);
+  --markstream-diff-removed-inline: var(--diff-removed-inline-bg);
   --markstream-diff-added-inline-border: transparent;
   --markstream-diff-removed-inline-border: transparent;
   --markstream-diff-added-gutter: linear-gradient(
     90deg,
     var(--markstream-diff-added-fg) 0 var(--stream-monaco-gutter-marker-width, 4px),
-    rgb(20 184 166 / 0.08) var(--stream-monaco-gutter-marker-width, 4px) 100%
+    hsl(var(--ms-diff-added) / 0.08) var(--stream-monaco-gutter-marker-width, 4px) 100%
   );
   --markstream-diff-removed-gutter: repeating-linear-gradient(
         180deg,
@@ -2033,59 +2234,58 @@ onUnmounted(() => {
         transparent 2px 4px
       )
       left / var(--stream-monaco-gutter-marker-width, 4px) 100% no-repeat,
-    linear-gradient(90deg, rgb(255 54 88 / 0.08) 0 100%);
-  --markstream-diff-added-line-fill: rgb(231 248 244 / 0.96);
-  --markstream-diff-removed-line-fill: rgb(255 241 241 / 0.98);
+    linear-gradient(90deg, hsl(var(--ms-diff-removed) / 0.08) 0 100%);
+  --markstream-diff-added-line-fill: var(--diff-added-bg);
+  --markstream-diff-removed-line-fill: var(--diff-removed-bg);
 }
 
 .code-block-container.is-dark {
-  --markstream-code-fallback-bg: #111827;
-  --markstream-code-fallback-fg: #e5e7eb;
-  --markstream-code-border-color: rgb(55 65 81 / 0.3);
-  --markstream-code-fallback-selection-bg: rgba(255, 255, 255, 0.08);
-  --markstream-diff-frame-border: rgb(82 82 91 / 0.56);
-  --markstream-diff-frame-shadow: 0 18px 40px -30px rgb(0 0 0 / 0.84);
-  --markstream-diff-shell-fg: #e2e8f0;
-  --markstream-diff-shell-muted: #94a3b8;
-  --markstream-diff-shell-border: rgb(82 82 91 / 0.56);
-  --markstream-diff-shell-shadow: 0 34px 80px -52px rgb(0 0 0 / 0.72);
-  --markstream-diff-shell-bg: rgb(10 10 11 / 0.99);
-  --markstream-diff-header-border: rgb(63 63 70 / 0.82);
-  --markstream-diff-stage-bg: rgb(10 10 11 / 0.99);
-  --markstream-diff-editor-bg: rgb(12 12 14 / 0.99);
-  --markstream-diff-editor-fg: #b6c2d3;
-  --markstream-diff-unchanged-fg: #cbd5e1;
-  --markstream-diff-unchanged-bg: rgb(24 24 27 / 0.92);
-  --markstream-diff-unchanged-divider: rgb(255 255 255 / 0.18);
-  --markstream-diff-focus: rgb(96 165 250 / 0.42);
-  --markstream-diff-widget-shadow: rgb(0 0 0 / 0.72);
-  --markstream-diff-action-hover: rgb(255 255 255 / 0.08);
-  --markstream-diff-panel-bg: rgb(10 10 11 / 0.99);
-  --markstream-diff-panel-bg-soft: rgb(10 10 11 / 0.99);
-  --markstream-diff-panel-bg-strong: rgb(10 10 11 / 0.99);
-  --markstream-diff-panel-border: rgb(82 82 91 / 0.3);
-  --markstream-diff-pane-divider: rgb(82 82 91 / 0.34);
+  --markstream-code-fallback-bg: var(--code-bg);
+  --markstream-code-fallback-fg: var(--code-fg);
+  --markstream-code-border-color: var(--code-border);
+  --markstream-code-fallback-selection-bg: var(--code-selection-bg);
+  --markstream-diff-frame-border: var(--code-border);
+  --markstream-diff-frame-shadow: 0 18px 40px -30px hsl(var(--ms-foreground) / 0.84);
+  --markstream-diff-shell-fg: hsl(var(--ms-foreground));
+  --markstream-diff-shell-muted: hsl(var(--ms-muted-foreground));
+  --markstream-diff-shell-border: var(--code-border);
+  --markstream-diff-shell-shadow: var(--ms-shadow-subtle);
+  --markstream-diff-shell-bg: var(--code-bg);
+  --markstream-diff-header-border: hsl(var(--ms-border) / 0.82);
+  --markstream-diff-editor-bg: var(--code-bg);
+  --markstream-diff-editor-fg: hsl(var(--ms-foreground));
+  --markstream-diff-unchanged-fg: hsl(var(--ms-foreground));
+  --markstream-diff-unchanged-bg: hsl(var(--ms-muted));
+  --markstream-diff-unchanged-divider: hsl(var(--ms-background) / 0.18);
+  --markstream-diff-focus: var(--focus-ring);
+  --markstream-diff-widget-shadow: hsl(var(--ms-foreground) / 0.72);
+  --markstream-diff-action-hover: var(--code-action-hover-bg);
+  --markstream-diff-panel-bg: hsl(var(--ms-background) / 0.99);
+  --markstream-diff-panel-bg-soft: hsl(var(--ms-background) / 0.99);
+  --markstream-diff-panel-bg-strong: hsl(var(--ms-background) / 0.99);
+  --markstream-diff-panel-border: hsl(var(--ms-border) / 0.3);
+  --markstream-diff-pane-divider: hsl(var(--ms-border) / 0.34);
   --markstream-diff-gutter-bg: linear-gradient(
     180deg,
-    rgb(13 13 15 / 0.94) 0%,
-    rgb(9 9 10 / 0.98) 100%
+    hsl(var(--ms-background) / 0.94) 0%,
+    hsl(var(--ms-background) / 0.98) 100%
   );
-  --markstream-diff-gutter-guide: rgb(161 161 170 / 0.08);
-  --markstream-diff-gutter-gap: 16px;
-  --markstream-diff-line-number: rgb(161 161 170 / 0.68);
-  --markstream-diff-line-number-active: rgb(228 228 231 / 0.82);
-  --markstream-diff-added-fg: #5eead4;
-  --markstream-diff-removed-fg: #fda4af;
-  --markstream-diff-added-line: rgb(13 148 136 / 0.18);
-  --markstream-diff-removed-line: rgb(225 29 72 / 0.18);
-  --markstream-diff-added-inline: rgb(45 212 191 / 0.24);
-  --markstream-diff-removed-inline: rgb(251 113 133 / 0.24);
+  --markstream-diff-gutter-guide: hsl(var(--ms-muted-foreground) / 0.08);
+  --markstream-diff-gutter-gap: 8px;
+  --markstream-diff-line-number: var(--code-line-number);
+  --markstream-diff-line-number-active: var(--code-line-number);
+  --markstream-diff-added-fg: var(--diff-added-fg);
+  --markstream-diff-removed-fg: var(--diff-removed-fg);
+  --markstream-diff-added-line: var(--diff-added-bg);
+  --markstream-diff-removed-line: var(--diff-removed-bg);
+  --markstream-diff-added-inline: var(--diff-added-inline-bg);
+  --markstream-diff-removed-inline: var(--diff-removed-inline-bg);
   --markstream-diff-added-inline-border: transparent;
   --markstream-diff-removed-inline-border: transparent;
   --markstream-diff-added-gutter: linear-gradient(
     90deg,
     var(--markstream-diff-added-fg) 0 var(--stream-monaco-gutter-marker-width, 4px),
-    rgb(94 234 212 / 0.2) var(--stream-monaco-gutter-marker-width, 4px) 100%
+    hsl(var(--ms-diff-added) / 0.2) var(--stream-monaco-gutter-marker-width, 4px) 100%
   );
   --markstream-diff-removed-gutter: repeating-linear-gradient(
         180deg,
@@ -2093,65 +2293,17 @@ onUnmounted(() => {
         transparent 2px 4px
       )
       left / var(--stream-monaco-gutter-marker-width, 4px) 100% no-repeat,
-    linear-gradient(90deg, rgb(253 164 175 / 0.18) 0 100%);
-  --markstream-diff-added-line-fill: linear-gradient(
-    90deg,
-    rgb(15 118 110 / 0.38) 0%,
-    rgb(13 148 136 / 0.28) 100%
-  );
-  --markstream-diff-removed-line-fill: linear-gradient(
-    90deg,
-    rgb(159 18 57 / 0.38) 0%,
-    rgb(225 29 72 / 0.28) 100%
-  );
+    linear-gradient(90deg, hsl(var(--ms-diff-removed) / 0.18) 0 100%);
+  --markstream-diff-added-line-fill: var(--diff-added-bg);
+  --markstream-diff-removed-line-fill: var(--diff-removed-bg);
 }
 
 .code-editor-container {
-  transition: height 180ms ease, max-height 180ms ease;
+  transition: height var(--ms-duration-standard) var(--ms-ease-standard), max-height var(--ms-duration-standard) var(--ms-ease-standard);
 }
 
-.code-block-header {
-  gap: 16px;
-}
-
-.code-header-main {
-  min-width: 0;
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  overflow: hidden;
-}
-
-.code-header-copy {
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.code-header-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.code-header-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 14px;
-  font-weight: 650;
-  letter-spacing: 0.01em;
-}
-
-.code-header-caption {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  color: color-mix(in srgb, var(--vscode-editor-foreground, currentColor) 62%, transparent);
+.code-block-container.is-diff .code-editor-container {
+  transition: none;
 }
 
 .code-editor-layer {
@@ -2181,27 +2333,22 @@ onUnmounted(() => {
   color: var(--vscode-editor-foreground, var(--markstream-code-fallback-fg)) !important;
 }
 
-.code-block-container.is-diff .code-block-header {
-  padding: 18px 20px 14px;
-  color: var(--markstream-diff-shell-fg);
-  background: transparent;
-  border-bottom-color: var(--markstream-diff-header-border);
-}
-
 .code-block-container.is-diff {
+  color: var(--markstream-diff-shell-fg);
+  border-color: var(--markstream-diff-shell-border);
   background: var(--markstream-diff-shell-bg);
   box-shadow: var(--markstream-diff-shell-shadow);
-  border-color: var(--markstream-diff-shell-border);
   --vscode-editor-selectionBackground: var(--markstream-diff-action-hover);
-}
-
-.code-block-container.is-diff .code-header-caption {
-  color: var(--markstream-diff-shell-muted);
+  /* Override shared tokens so CodeBlockShell header inherits diff styling */
+  --code-fg: var(--markstream-diff-shell-fg);
+  --code-header-bg: transparent;
+  --code-border: var(--markstream-diff-header-border);
+  --code-line-number: var(--markstream-diff-shell-muted);
+  --code-action-fg: var(--markstream-diff-shell-muted);
 }
 
 .code-block-container.is-diff .code-editor-layer {
-  padding: 4px 4px 8px;
-  background: var(--markstream-diff-stage-bg);
+  background: transparent;
   --vscode-editor-background: var(--markstream-diff-editor-bg);
   --vscode-editor-foreground: var(--markstream-diff-editor-fg);
   --vscode-diffEditor-unchangedRegionForeground: var(--markstream-diff-unchanged-fg);
@@ -2217,26 +2364,26 @@ onUnmounted(() => {
   --stream-monaco-editor-fg: var(--markstream-diff-editor-fg);
   --stream-monaco-unchanged-fg: var(--markstream-diff-unchanged-fg);
   --stream-monaco-unchanged-bg: var(--markstream-diff-unchanged-bg);
-  --stream-monaco-frame-radius: 18px;
-  --stream-monaco-fixed-editor-bg: var(--markstream-diff-panel-bg-strong);
-  --stream-monaco-frame-border: var(--markstream-diff-frame-border);
-  --stream-monaco-frame-shadow: var(--markstream-diff-frame-shadow);
-  --stream-monaco-panel-bg: var(--markstream-diff-panel-bg);
-  --stream-monaco-panel-bg-soft: var(--markstream-diff-panel-bg-soft);
-  --stream-monaco-panel-bg-strong: var(--markstream-diff-panel-bg-strong);
-  --stream-monaco-panel-border: var(--markstream-diff-panel-border);
+  --stream-monaco-frame-radius: 0;
+  --stream-monaco-fixed-editor-bg: var(--markstream-diff-editor-bg);
+  --stream-monaco-frame-border: transparent;
+  --stream-monaco-frame-shadow: none;
+  --stream-monaco-panel-bg: var(--markstream-diff-editor-bg);
+  --stream-monaco-panel-bg-soft: var(--markstream-diff-editor-bg);
+  --stream-monaco-panel-bg-strong: var(--markstream-diff-editor-bg);
+  --stream-monaco-panel-border: transparent;
   --stream-monaco-pane-divider: var(--markstream-diff-pane-divider);
   --stream-monaco-gutter-bg: var(--markstream-diff-gutter-bg);
   --stream-monaco-gutter-guide: var(--markstream-diff-gutter-guide);
-  --stream-monaco-gutter-marker-width: 4px;
-  --stream-monaco-gutter-gap: var(--markstream-diff-gutter-gap);
+  --stream-monaco-gutter-marker-width: 3px;
+  --stream-monaco-gutter-gap: 8px;
   --stream-monaco-line-number: var(--markstream-diff-line-number);
   --stream-monaco-line-number-active: var(--markstream-diff-line-number-active);
   --stream-monaco-line-number-left: calc(
     var(--stream-monaco-gutter-marker-width) + var(--stream-monaco-gutter-gap)
   );
-  --stream-monaco-line-number-width: 36px;
-  --stream-monaco-line-number-align: center;
+  --stream-monaco-line-number-width: 28px;
+  --stream-monaco-line-number-align: right;
   --stream-monaco-original-margin-width: calc(
     var(--stream-monaco-gutter-marker-width) +
       (var(--stream-monaco-gutter-gap) * 2) +
@@ -2271,10 +2418,9 @@ onUnmounted(() => {
   --stream-monaco-removed-gutter: var(--markstream-diff-removed-gutter);
   --stream-monaco-added-line-fill: var(--markstream-diff-added-line-fill);
   --stream-monaco-removed-line-fill: var(--markstream-diff-removed-line-fill);
-}
-
-.code-block-container.is-diff.is-dark .code-editor-layer {
-  background: var(--markstream-diff-stage-bg);
+  --stream-monaco-added-border: hsl(var(--ms-diff-added) / 0.25);
+  --stream-monaco-removed-border: hsl(var(--ms-diff-removed) / 0.25);
+  --stream-monaco-widget-shadow: var(--markstream-diff-widget-shadow);
 }
 
 .code-editor-container.is-hidden {
@@ -2289,7 +2435,7 @@ onUnmounted(() => {
   background: transparent;
   color: var(--vscode-editor-foreground, inherit);
   /* Match Monaco defaults to avoid a jarring swap while it loads */
-  font-size: var(--vscode-editor-font-size, 12px);
+  font-size: var(--vscode-editor-font-size, 14px);
   font-weight: 400;
   font-family: var(
     --markstream-code-font-family,
@@ -2319,14 +2465,14 @@ onUnmounted(() => {
 .code-block-container.is-rendering .code-height-placeholder{
   background-size: 400% 100%;
   animation: code-skeleton-shimmer 1.2s ease-in-out infinite;
-  min-height: 120px;
-  background: linear-gradient(90deg, rgba(0,0,0,0.04) 25%, rgba(0,0,0,0.08) 37%, rgba(0,0,0,0.04) 63%);
+  min-height: var(--ms-size-skeleton-min-height);
+  background: linear-gradient(90deg, var(--loading-shimmer) 25%, hsl(var(--ms-muted) / 0.7) 37%, var(--loading-shimmer) 63%);
 }
 
 /* Loading placeholder styles */
 .code-loading-placeholder {
   padding: 1rem;
-  min-height: 120px;
+  min-height: var(--ms-size-skeleton-min-height);
 }
 
 .loading-skeleton {
@@ -2337,15 +2483,10 @@ onUnmounted(() => {
 
 .skeleton-line {
   height: 1rem;
-  background: linear-gradient(90deg, rgba(0,0,0,0.06) 25%, rgba(0,0,0,0.12) 37%, rgba(0,0,0,0.06) 63%);
+  background: linear-gradient(90deg, var(--loading-shimmer) 25%, hsl(var(--ms-muted) / 0.7) 37%, var(--loading-shimmer) 63%);
   background-size: 400% 100%;
   animation: code-skeleton-shimmer 1.2s ease-in-out infinite;
-  border-radius: 0.25rem;
-}
-
-.code-block-container.is-dark .skeleton-line {
-  background: linear-gradient(90deg, rgba(255,255,255,0.06) 25%, rgba(255,255,255,0.12) 37%, rgba(255,255,255,0.06) 63%);
-  background-size: 400% 100%;
+  border-radius: calc(var(--ms-radius) * 0.5);
 }
 
 .skeleton-line.short {
@@ -2357,117 +2498,51 @@ onUnmounted(() => {
   100% { background-position: 0 0; }
 }
 
-.code-action-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 2rem;
-  min-height: 2rem;
-  padding: 0.5rem;
-  border-radius: 0.375rem;
-  line-height: 1;
-  flex-shrink: 0;
-  font-family: inherit;
+/* ── Unchanged lines widget (ghost style) ── */
+:deep(.stream-monaco-diff-root .monaco-editor .diff-hidden-lines .center) {
+  border-radius: var(--ms-radius) !important;
+  background: transparent !important;
+  border: 1px solid transparent !important;
+  box-shadow: none !important;
+  min-height: 28px !important;
+  transition: background-color 0.14s ease, border-color 0.14s ease !important;
 }
 
-.code-block-container.is-diff .icon-slot {
-  width: 28px;
-  height: 28px;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.7);
-  padding: 5px;
-  color: var(--markstream-diff-added-fg);
+:deep(.stream-monaco-diff-root .monaco-editor .diff-hidden-lines .center:hover),
+:deep(.stream-monaco-diff-root .monaco-editor .diff-hidden-lines .center.stream-monaco-focus-within) {
+  background: color-mix(in srgb, var(--stream-monaco-editor-fg) 4%, transparent) !important;
+  border-color: color-mix(in srgb, var(--stream-monaco-editor-fg) 10%, transparent) !important;
+  box-shadow: none !important;
 }
 
-.code-block-container.is-diff.is-dark .icon-slot {
-  box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.08),
-    0 12px 28px -20px rgb(56 189 248 / 0.45);
+:deep(.stream-monaco-diff-root.stream-monaco-diff-appearance-dark .monaco-editor .diff-hidden-lines .center) {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
 }
 
-.code-diff-stats {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+:deep(.stream-monaco-diff-root.stream-monaco-diff-appearance-dark .monaco-editor .diff-hidden-lines .center:hover),
+:deep(.stream-monaco-diff-root.stream-monaco-diff-appearance-dark .monaco-editor .diff-hidden-lines .center.stream-monaco-focus-within) {
+  background: color-mix(in srgb, var(--stream-monaco-editor-fg) 6%, transparent) !important;
+  border-color: color-mix(in srgb, var(--stream-monaco-editor-fg) 12%, transparent) !important;
+  box-shadow: none !important;
+}
+
+/* Expand icon before the count label */
+:deep(.stream-monaco-diff-root .monaco-editor .diff-hidden-lines .center .stream-monaco-unchanged-count)::before {
+  content: '';
+  display: inline-block;
+  width: 14px;
+  height: 14px;
   margin-right: 4px;
-  font-size: 13px;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: 0.02em;
-  font-variant-numeric: tabular-nums;
-}
-
-.code-diff-stat {
-  display: inline-flex;
-  align-items: center;
-}
-
-.code-diff-stat.removed {
-  color: var(--vscode-diffEditor-removedTextForeground, var(--markstream-diff-removed-fg));
-}
-
-.code-diff-stat.added {
-  color: var(--vscode-diffEditor-insertedTextForeground, var(--markstream-diff-added-fg));
-}
-
-.code-block-container.is-dark .code-diff-stat {
-  padding: 3px 9px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  line-height: 1;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
-}
-
-.code-block-container.is-dark .code-diff-stat.removed {
-  color: #fb7185;
-  background: rgb(159 18 57 / 0.16);
-  border-color: rgb(251 113 133 / 0.2);
-}
-
-.code-block-container.is-dark .code-diff-stat.added {
-  color: #2dd4bf;
-  background: rgb(15 118 110 / 0.16);
-  border-color: rgb(45 212 191 / 0.22);
-}
-
-.code-action-btn:active {
-  transform: scale(0.98);
-}
-
-.code-action-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.code-action-btn:disabled:hover {
-  background-color: transparent;
-}
-
-/* Ensure injected icons align consistently whether img or inline svg */
-.icon-slot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.icon-slot :deep(svg),
-.icon-slot :deep(img) {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-
-@container (max-width: 640px) {
-  .code-block-container.is-diff .code-block-header {
-    padding: 16px 16px 12px;
-  }
-
-  .code-block-container.is-diff .code-editor-layer {
-    padding: 4px 4px 8px;
-  }
-
-  .code-diff-stats {
-    gap: 6px;
-    font-size: 12px;
-  }
+  flex-shrink: 0;
+  background: currentColor;
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 15 5 5 5-5'/%3E%3Cpath d='m7 9 5-5 5 5'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 15 5 5 5-5'/%3E%3Cpath d='m7 9 5-5 5 5'/%3E%3C/svg%3E");
+  mask-size: contain;
+  -webkit-mask-size: contain;
+  mask-repeat: no-repeat;
+  -webkit-mask-repeat: no-repeat;
 }
 
 :deep(.monaco-diff-editor .diffOverview){
@@ -2593,6 +2668,22 @@ onUnmounted(() => {
   justify-content: center;
 }
 
+:deep(.monaco-diff-editor:not(.side-by-side) .editor.modified .diff-hidden-lines .center) {
+  align-items: center;
+  justify-content: center !important;
+  position: relative;
+}
+
+:deep(.monaco-diff-editor:not(.side-by-side) .editor.modified .diff-hidden-lines .center:not(.stream-monaco-clickable)) {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+:deep(.monaco-diff-editor:not(.side-by-side) .editor.modified .diff-hidden-lines .center .stream-monaco-unchanged-meta) {
+  justify-content: center !important;
+  padding: 0 28px !important;
+}
+
 :deep(.monaco-diff-editor:not(.side-by-side) .editor.original .diff-hidden-lines .center > div:first-child) {
   align-items: center;
   display: flex;
@@ -2601,41 +2692,27 @@ onUnmounted(() => {
   width: 100% !important;
 }
 
-:deep(.monaco-diff-editor:not(.side-by-side) .editor.modified .diff-hidden-lines .center > div:first-child) {
-  display: none !important;
-}
-
 :deep(.markstream-inline-fold-proxy) {
-  align-items: center;
   appearance: none;
   background: transparent;
   border: 0;
-  border-radius: 4px;
+  border-radius: calc(var(--ms-radius) * 0.5);
   box-shadow: none;
-  color: var(--vscode-diffEditor-unchangedRegionForeground, currentColor);
   cursor: pointer;
-  display: inline-flex;
-  height: 16px;
-  justify-content: center;
+  inset: 0;
   padding: 0;
-  width: 16px;
+  pointer-events: auto;
+  position: absolute;
+  z-index: 2;
 }
 
 :deep(.markstream-inline-fold-proxy:hover),
 :deep(.markstream-inline-fold-proxy:focus-visible) {
-  color: var(--vscode-editorLink-activeForeground, var(--vscode-diffEditor-unchangedRegionForeground, currentColor));
+  background: transparent;
 }
 
 :deep(.markstream-inline-fold-proxy:focus-visible) {
   outline: 1px solid var(--vscode-focusBorder, currentColor);
-  outline-offset: 1px;
-}
-
-:deep(.markstream-inline-fold-proxy .codicon) {
-  color: inherit;
-  font-size: 16px;
-  height: 16px;
-  line-height: 16px;
-  width: 16px;
+  outline-offset: -1px;
 }
 </style>

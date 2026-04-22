@@ -1,5 +1,13 @@
 import type { BaseNode, CustomComponentAttrs, ParsedNode } from 'stream-markdown-parser'
-import { getMarkdown } from 'stream-markdown-parser'
+import {
+  DANGEROUS_HTML_ATTRS,
+  getMarkdown,
+  isUnsafeHtmlUrl,
+  NON_STRUCTURING_HTML_TAGS,
+  normalizeCustomHtmlTagName,
+  normalizeCustomHtmlTags,
+  URL_HTML_ATTRS,
+} from 'stream-markdown-parser'
 
 export type NestedRenderableNode = (ParsedNode | BaseNode) & Record<string, unknown>
 
@@ -105,7 +113,7 @@ function createRenderContext(options: NestedMarkdownHtmlOptions): RenderContext 
     markdown,
     options: {
       allowHtml: options.allowHtml !== false,
-      customNodeTag: normalizeTagName(options.customNodeTag) || DEFAULT_CUSTOM_NODE_TAG,
+      customNodeTag: normalizeCustomHtmlTagName(options.customNodeTag) || DEFAULT_CUSTOM_NODE_TAG,
       customNodeClass: options.customNodeClass,
     },
   }
@@ -299,13 +307,18 @@ function renderAdmonitionNode(node: NestedRenderableNode, ctx: RenderContext): s
 
 function renderHtmlNode(node: NestedRenderableNode, ctx: RenderContext): string {
   const content = getString(node.content)
-  if (!content)
-    return ''
+  const rawContent = content || getString(node.raw)
+  const tag = getString(node.tag).trim().toLowerCase()
+  const children = getNodeList(node.children)
   if (!ctx.options.allowHtml)
-    return escapeHtml(content)
+    return escapeHtml(rawContent)
   if (node.loading && !node.autoClosed)
-    return escapeHtml(content)
-  return content
+    return escapeHtml(rawContent)
+  if (tag && children.length > 0 && !NON_STRUCTURING_HTML_TAGS.has(tag)) {
+    const attrs = serializeAttrs(node.attrs as CustomComponentAttrs | undefined)
+    return `<${tag}${attrs}>${renderNodesToHtml(children, ctx)}</${tag}>`
+  }
+  return rawContent
 }
 
 function renderCustomOrFallbackNode(node: NestedRenderableNode, ctx: RenderContext): string {
@@ -366,16 +379,22 @@ function serializeAttrs(attrs?: CustomComponentAttrs | null, extraClass = ''): s
   const mergedClasses = [extraClass]
 
   for (const [name, value] of pairs) {
-    if (!isSafeAttrName(name))
+    const safeName = String(name).trim()
+    const lowerName = safeName.toLowerCase()
+    if (!safeName || !isSafeAttrName(safeName))
       continue
-    if (name === 'class') {
+    if (DANGEROUS_HTML_ATTRS.has(lowerName))
+      continue
+    if (value !== true && URL_HTML_ATTRS.has(lowerName) && value && isUnsafeHtmlUrl(String(value)))
+      continue
+    if (lowerName === 'class') {
       mergedClasses.push(String(value))
       continue
     }
     if (value === true)
-      rendered.push(` ${name}`)
+      rendered.push(` ${safeName}`)
     else
-      rendered.push(` ${name}="${escapeAttr(String(value))}"`)
+      rendered.push(` ${safeName}="${escapeAttr(String(value))}"`)
   }
 
   const className = mergedClasses.map(value => value.trim()).filter(Boolean).join(' ')
@@ -412,29 +431,6 @@ function getString(value: unknown): string {
     : value == null
       ? ''
       : String(value)
-}
-
-function normalizeCustomHtmlTags(tags?: readonly string[]): string[] {
-  if (!tags || tags.length === 0)
-    return []
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const value = normalizeTagName(tag)
-    if (!value || seen.has(value))
-      continue
-    seen.add(value)
-    normalized.push(value)
-  }
-  return normalized
-}
-
-function normalizeTagName(value: unknown): string {
-  const raw = getString(value).trim()
-  if (!raw)
-    return ''
-  const match = raw.match(/^[<\s/]*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
 }
 
 function isSafeAttrName(value: string): boolean {

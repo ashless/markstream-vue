@@ -2,7 +2,7 @@
 import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
 import type { VisibilityHandle } from '../../composables/viewportPriority'
 import type { D2BlockNodeProps, InfographicBlockNodeProps, MermaidBlockNodeProps } from '../../types/component-props'
-import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
+import { getMarkdown, mergeCustomHtmlTags, parseMarkdownToStructure, resolveCustomHtmlTags } from 'stream-markdown-parser'
 import { computed, getCurrentInstance, markRaw, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, watch } from 'vue-demi'
 import AdmonitionNode from '../../components/AdmonitionNode'
 import BlockquoteNode from '../../components/BlockquoteNode'
@@ -34,6 +34,7 @@ import TextNode from '../../components/TextNode'
 import ThematicBreakNode from '../../components/ThematicBreakNode'
 import VmrContainerNode from '../../components/VmrContainerNode'
 import { provideViewportPriority } from '../../composables/viewportPriority'
+import { getHtmlTagFromContent, shouldRenderUnknownHtmlTagAsText, stripCustomHtmlWrapper } from '../../utils/htmlRenderer'
 import { customComponentsRevision, getCustomNodeComponents } from '../../utils/nodeComponents'
 import { isLegacyVue26Vm } from '../../utils/vue26'
 import HtmlBlockNode from '../HtmlBlockNode/HtmlBlockNode.vue'
@@ -210,8 +211,13 @@ const instanceMsgId = props.customId
 const defaultMd = getMarkdown(instanceMsgId)
 const customTagCache = new Map<string, MarkdownIt>()
 const EMPTY_PARSED_NODES = markRaw([] as ParsedNode[])
+const customComponentsMap = computed(() => {
+  void customComponentsRevision.value
+  return getCustomNodeComponents(props.customId)
+})
+const effectiveCustomHtmlTags = computed(() => mergeCustomHtmlTags(props.customHtmlTags, (props.parseOptions as any)?.customHtmlTags))
 const mdBase = computed(() => {
-  const { key, tags } = resolveCustomHtmlTags(props.customHtmlTags)
+  const { key, tags } = resolveCustomHtmlTags(effectiveCustomHtmlTags.value)
   if (!key)
     return defaultMd
   const cached = customTagCache.get(key)
@@ -227,31 +233,6 @@ const mdInstance = computed(() => {
     ? props.customMarkdownIt(base)
     : base
 })
-
-function normalizeCustomTag(t: unknown) {
-  const raw = String(t ?? '').trim()
-  if (!raw)
-    return ''
-  const m = raw.match(/^[<\s/]*([A-Z][\w-]*)/i)
-  return m ? m[1].toLowerCase() : ''
-}
-
-function resolveCustomHtmlTags(tags?: readonly string[]) {
-  if (!tags || tags.length === 0)
-    return { key: '', tags: [] as string[] }
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const value = normalizeCustomTag(tag)
-    if (!value || seen.has(value))
-      continue
-    seen.add(value)
-    normalized.push(value)
-  }
-  if (normalized.length === 0)
-    return { key: '', tags: [] as string[] }
-  return { key: normalized.join(','), tags: normalized }
-}
 
 function cloneNodeValue<T>(value: T): T {
   if (Array.isArray(value))
@@ -271,11 +252,7 @@ function cloneParsedNodeList(nodes: ParsedNode[]) {
 const mergedParseOptions = computed(() => {
   const base = props.parseOptions ?? {}
   const resolvedFinal = props.final ?? (base as any).final
-  const propTags = props.customHtmlTags ?? []
-  const optionTags = (base as any).customHtmlTags ?? []
-  const merged = [...propTags, ...optionTags]
-    .map(normalizeCustomTag)
-    .filter(Boolean)
+  const merged = effectiveCustomHtmlTags.value
   const hasFinal = resolvedFinal != null
   const hasCustom = merged.length > 0
 
@@ -285,7 +262,7 @@ const mergedParseOptions = computed(() => {
   return {
     ...(base as any),
     ...(hasFinal ? { final: resolvedFinal } : {}),
-    ...(hasCustom ? { customHtmlTags: Array.from(new Set(merged)) } : {}),
+    ...(hasCustom ? { customHtmlTags: merged } : {}),
   } as ParseOptions
 })
 
@@ -1616,10 +1593,6 @@ const nodeComponents = {
   // 可以添加更多节点类型
   // 例如:custom_node: CustomNode,
 }
-const customComponentsMap = computed(() => {
-  void customComponentsRevision.value
-  return getCustomNodeComponents(props.customId)
-})
 const indexPrefix = computed(() => (props.indexKey != null ? String(props.indexKey) : 'markdown-renderer'))
 const codeBlockBindings = computed(() => ({
   // streaming behavior control for CodeBlockNode
@@ -1646,6 +1619,8 @@ const nonCodeBindings = computed(() => ({
   // Forward `typewriter` flag to non-code node components so they can
   // opt in/out of enter transitions or other typewriter-like behaviour.
   typewriter: props.typewriter,
+  // Forward customHtmlTags for non-whitelisted tag detection in child components
+  customHtmlTags: mergedParseOptions.value.customHtmlTags,
 }))
 const linkBindings = computed(() => ({
   ...nonCodeBindings.value,
@@ -1669,17 +1644,39 @@ const legacyRenderedItems = computed(() => {
     ) {
       const tag = String((node as any).tag ?? '').trim().toLowerCase()
         || getHtmlTagFromContent((node as any).content)
-      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
-        const customComponents = customComponentsMap.value
-        const customForTag = (customComponents as any)[tag]
-        if (customForTag) {
-          component = customForTag
-          resolvedNode = {
-            ...(node as any),
-            type: tag,
-            tag,
-            content: stripCustomHtmlWrapper((node as any).content, tag),
-          } as ParsedNode
+      if (tag) {
+        // Check if tag is whitelisted in customHtmlTags
+        if (effectiveCustomHtmlTagsSet.value.has(tag)) {
+          const customComponents = customComponentsMap.value
+          const customForTag = (customComponents as any)[tag]
+          if (customForTag) {
+            component = customForTag
+            resolvedNode = {
+              ...(node as any),
+              type: tag,
+              tag,
+              content: stripCustomHtmlWrapper((node as any).content, tag),
+            } as ParsedNode
+          }
+        }
+        else if (shouldRenderUnknownHtmlTagAsText((node as any).content ?? (node as any).raw, tag)) {
+          const rawContent = String((node as any).content ?? (node as any).raw ?? '')
+          if (node.type === 'html_inline') {
+            component = TextNode
+            resolvedNode = {
+              type: 'text',
+              content: rawContent,
+              raw: rawContent,
+            } as ParsedNode
+          }
+          else {
+            component = ParagraphNode
+            resolvedNode = {
+              type: 'paragraph',
+              children: [{ type: 'text', content: rawContent, raw: rawContent }],
+              raw: rawContent,
+            } as ParsedNode
+          }
         }
       }
     }
@@ -1714,17 +1711,39 @@ const renderedItems = computed(() => {
     ) {
       const tag = String((node as any).tag ?? '').trim().toLowerCase()
         || getHtmlTagFromContent((node as any).content)
-      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
-        const customComponents = customComponentsMap.value
-        const customForTag = (customComponents as any)[tag]
-        if (customForTag) {
-          component = customForTag
-          node = {
-            ...(node as any),
-            type: tag,
-            tag,
-            content: stripCustomHtmlWrapper((node as any).content, tag),
-          } as ParsedNode
+      if (tag) {
+        // Check if tag is whitelisted in customHtmlTags
+        if (effectiveCustomHtmlTagsSet.value.has(tag)) {
+          const customComponents = customComponentsMap.value
+          const customForTag = (customComponents as any)[tag]
+          if (customForTag) {
+            component = customForTag
+            node = {
+              ...(node as any),
+              type: tag,
+              tag,
+              content: stripCustomHtmlWrapper((node as any).content, tag),
+            } as ParsedNode
+          }
+        }
+        else if (shouldRenderUnknownHtmlTagAsText((node as any).content ?? (node as any).raw, tag)) {
+          const rawContent = String((node as any).content ?? (node as any).raw ?? '')
+          if (node.type === 'html_inline') {
+            component = TextNode
+            node = {
+              type: 'text',
+              content: rawContent,
+              raw: rawContent,
+            } as ParsedNode
+          }
+          else {
+            component = ParagraphNode
+            node = {
+              type: 'paragraph',
+              children: [{ type: 'text', content: rawContent, raw: rawContent }],
+              raw: rawContent,
+            } as ParsedNode
+          }
         }
       }
     }
@@ -1763,23 +1782,6 @@ function getCodeBlockRenderNode(node: ParsedNode) {
   const cloned = { ...codeBlockNode } as ParsedNode
   codeBlockRenderCache.set(codeBlockNode, { signature, node: cloned })
   return cloned
-}
-
-function getHtmlTagFromContent(html: unknown) {
-  const raw = String(html ?? '')
-  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-function stripCustomHtmlWrapper(html: unknown, tag: string) {
-  const raw = String(html ?? '')
-  if (!tag)
-    return raw
-  // Escape special regex characters to prevent unexpected behavior.
-  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const openRe = new RegExp(String.raw`^\s*<\s*${escaped}(?:\s[^>]*)?>\s*`, 'i')
-  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${escaped}\s*>\s*$`, 'i')
-  return raw.replace(openRe, '').replace(closeRe, '')
 }
 
 function getCodeBlockLanguage(node: ParsedNode) {
@@ -1991,7 +1993,7 @@ function handleContainerMouseout(event: MouseEvent) {
       :code-block-props="props.codeBlockProps"
       :themes="props.themes"
       :is-dark="props.isDark"
-      :custom-html-tags="props.customHtmlTags"
+      :custom-html-tags="mergedParseOptions.value.customHtmlTags"
       @copy="emit('copy', $event)"
       @handle-artifact-click="emit('handleArtifactClick', $event)"
     />

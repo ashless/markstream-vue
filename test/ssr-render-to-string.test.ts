@@ -123,9 +123,36 @@ Footnotes are server-rendered.[^1]
     expect(html).toContain('<table')
     expect(html).toContain('href="https://vuejs.org"')
     expect(html).toContain('src="/vue-markdown-icon.svg"')
-    expect(html).toContain('<figure')
-    expect(html).not.toMatch(/<p[^>]*>\s*<figure/)
+    expect(html).not.toContain('<figure')
     expect(html).toContain('Footnote body')
+  })
+
+  it('renders structured html wrappers on the server without duplicating nested markdown', async () => {
+    const html = await renderMarkdown(`<span style="font-size: 12px;">
+
+- alpha
+- beta
+
+</span>`)
+
+    expect(html).toContain('<span')
+    expect(html).toContain('font-size:12px;')
+    expect(html).toContain('<ul')
+    expect(html.match(/alpha/g)?.length ?? 0).toBe(1)
+    expect(html.match(/beta/g)?.length ?? 0).toBe(1)
+  })
+
+  it('renders nested structured html wrappers on the server', async () => {
+    const html = await renderMarkdown(`<div>
+<div>
+
+- alpha
+
+</div>
+</div>`)
+
+    expect(html.match(/<ul/g)?.length ?? 0).toBe(1)
+    expect(html.match(/alpha/g)?.length ?? 0).toBe(1)
   })
 
   it('renders an explicit SSR matrix for the lighter built-in node components', async () => {
@@ -298,7 +325,7 @@ Footnotes are server-rendered.[^1]
     expect(html).toContain('class="footnote-reference"')
     expect(html).toContain('class="hard-break"')
     expect(html).toContain('<blockquote')
-    expect(html).toContain('type="checkbox"')
+    expect(html).toContain('class="checkbox-node"')
     expect(html).toContain('<ol')
     expect(html).toContain('<dl')
     expect(html).toContain('<table')

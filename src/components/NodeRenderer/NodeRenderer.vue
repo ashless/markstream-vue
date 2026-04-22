@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import type { MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
+import type { MarkdownIt, ParsedNode } from 'stream-markdown-parser'
 import type { VisibilityHandle } from '../../composables/viewportPriority'
+import type { CustomComponents } from '../../types'
 import type { NodeRendererProps } from '../../types/node-renderer-props'
-import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
+import { getMarkdown, mergeCustomHtmlTags, parseMarkdownToStructure, resolveCustomHtmlTags } from 'stream-markdown-parser'
 import { computed, defineAsyncComponent, markRaw, nextTick, onBeforeUnmount, provide, reactive, ref, useAttrs, watch } from 'vue'
 import AdmonitionNode from '../../components/AdmonitionNode'
 import BlockquoteNode from '../../components/BlockquoteNode'
@@ -34,9 +35,20 @@ import TextNode from '../../components/TextNode'
 import ThematicBreakNode from '../../components/ThematicBreakNode'
 import VmrContainerNode from '../../components/VmrContainerNode'
 import { provideViewportPriority } from '../../composables/viewportPriority'
+import {
+  buildBlockTextProfile,
+  createEmptySimpleTextProbeProfile,
+  estimateCodeBlockHeight,
+  estimateSimpleTextBlockHeight,
+  getHeightEstimationExperiment,
+  heightEstimationExperimentRevision,
+  registerHeightEstimationRendererController,
+} from '../../internal/heightEstimationExperiment'
+import { getHtmlTagFromContent, shouldRenderUnknownHtmlTagAsText, stripCustomHtmlWrapper } from '../../utils/htmlRenderer'
 import { customComponentsRevision, getCustomNodeComponents } from '../../utils/nodeComponents'
 import HtmlBlockNode from '../HtmlBlockNode/HtmlBlockNode.vue'
 import HtmlInlineNode from '../HtmlInlineNode/HtmlInlineNode.vue'
+import MarkdownCodeBlockNode from '../MarkdownCodeBlockNode'
 import { MathBlockNodeAsync, MathInlineNodeAsync } from './asyncComponent'
 import FallbackComponent from './FallbackComponent.vue'
 
@@ -44,6 +56,28 @@ import FallbackComponent from './FallbackComponent.vue'
 // 增加用于统一设置所有 code_block 主题和 Monaco 选项的外部 API
 interface IdleDeadlineLike {
   timeRemaining?: () => number
+}
+
+type RendererAttrs = Record<string, unknown> & {
+  'showTooltips'?: unknown
+  'show-tooltips'?: unknown
+}
+
+type RendererParseOptions = NonNullable<NodeRendererProps['parseOptions']>
+type RuntimeCodeBlockNode = ParsedNode & {
+  type: 'code_block'
+  language?: string
+  loading?: boolean
+  diff?: boolean
+  code?: string
+  originalCode?: string
+  updatedCode?: string
+  raw?: string
+}
+type RuntimeHtmlNode = ParsedNode & {
+  type: 'html_block' | 'html_inline'
+  tag?: string
+  content?: string
 }
 
 const props = withDefaults(defineProps<NodeRendererProps>(), {
@@ -69,17 +103,30 @@ const MAX_VIEWPORT_OBSERVER_TARGETS = 640
 const VIEWPORT_PRIORITY_RECOVERY_COUNT = 200
 
 const containerRef = ref<HTMLElement>()
+const paragraphProbeWrapperRef = ref<HTMLElement | null>(null)
+const listItemProbeWrapperRef = ref<HTMLElement | null>(null)
+const listProbeWrapperRef = ref<HTMLElement | null>(null)
+const headingProbeWrapperRefs = reactive<Record<number, HTMLElement | null>>({
+  1: null,
+  2: null,
+  3: null,
+  4: null,
+  5: null,
+  6: null,
+})
 const viewportPriorityAutoDisabled = ref(false)
 const SCROLL_PARENT_OVERFLOW_RE = /auto|scroll|overlay/i
 const isClient = typeof window !== 'undefined'
 const debugPerformanceEnabled = computed(() => props.debugPerformance && isClient && typeof console !== 'undefined')
-const attrs = useAttrs()
+const attrs = useAttrs() as RendererAttrs
 const textStreamState = new Map<string, string>()
 const streamRenderVersion = ref(0)
+const experimentContainerWidth = ref(0)
+const simpleTextProbeProfile = ref(createEmptySimpleTextProbeProfile())
 const resolvedShowTooltips = computed<boolean | undefined>(() => {
   if (typeof props.showTooltips === 'boolean')
     return props.showTooltips
-  const raw = (attrs as any).showTooltips ?? (attrs as any)['show-tooltips']
+  const raw = attrs.showTooltips ?? attrs['show-tooltips']
   if (raw === '' || raw === true || raw === 'true')
     return true
   if (raw === false || raw === 'false')
@@ -143,8 +190,13 @@ const instanceMsgId = props.customId
   : `renderer-${Date.now()}-${Math.random().toString(36).slice(2)}`
 const defaultMd = getMarkdown(instanceMsgId)
 const customTagCache = new Map<string, MarkdownIt>()
+const customComponentsMap = computed<Partial<CustomComponents>>(() => {
+  void customComponentsRevision.value
+  return getCustomNodeComponents(props.customId)
+})
+const effectiveCustomHtmlTags = computed(() => mergeCustomHtmlTags(props.customHtmlTags, props.parseOptions?.customHtmlTags))
 const mdBase = computed(() => {
-  const { key, tags } = resolveCustomHtmlTags(props.customHtmlTags)
+  const { key, tags } = resolveCustomHtmlTags(effectiveCustomHtmlTags.value)
   if (!key)
     return defaultMd
   const cached = customTagCache.get(key)
@@ -161,39 +213,10 @@ const mdInstance = computed(() => {
     : base
 })
 
-function normalizeCustomTag(t: unknown) {
-  const raw = String(t ?? '').trim()
-  if (!raw)
-    return ''
-  const m = raw.match(/^[<\s/]*([A-Z][\w-]*)/i)
-  return m ? m[1].toLowerCase() : ''
-}
-
-function resolveCustomHtmlTags(tags?: readonly string[]) {
-  if (!tags || tags.length === 0)
-    return { key: '', tags: [] as string[] }
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const value = normalizeCustomTag(tag)
-    if (!value || seen.has(value))
-      continue
-    seen.add(value)
-    normalized.push(value)
-  }
-  if (normalized.length === 0)
-    return { key: '', tags: [] as string[] }
-  return { key: normalized.join(','), tags: normalized }
-}
-
 const mergedParseOptions = computed(() => {
-  const base = props.parseOptions ?? {}
-  const resolvedFinal = props.final ?? (base as any).final
-  const propTags = props.customHtmlTags ?? []
-  const optionTags = (base as any).customHtmlTags ?? []
-  const merged = [...propTags, ...optionTags]
-    .map(normalizeCustomTag)
-    .filter(Boolean)
+  const base = (props.parseOptions ?? {}) as RendererParseOptions
+  const resolvedFinal = props.final ?? base.final
+  const merged = effectiveCustomHtmlTags.value
   const hasFinal = resolvedFinal != null
   const hasCustom = merged.length > 0
 
@@ -201,17 +224,17 @@ const mergedParseOptions = computed(() => {
     return base
 
   return {
-    ...(base as any),
+    ...base,
     ...(hasFinal ? { final: resolvedFinal } : {}),
-    ...(hasCustom ? { customHtmlTags: Array.from(new Set(merged)) } : {}),
-  } as ParseOptions
+    ...(hasCustom ? { customHtmlTags: merged } : {}),
+  } as RendererParseOptions
 })
 
 // Set of effective custom HTML tags (normalised to lowercase).
 // Used in `renderedItems` to coerce pre-parsed html_block/html_inline nodes
 // whose tag matches a registered custom component.
 const effectiveCustomHtmlTagsSet = computed<Set<string>>(() => {
-  const arr: string[] = (mergedParseOptions.value as any).customHtmlTags ?? []
+  const arr = mergedParseOptions.value.customHtmlTags ?? []
   return new Set(arr.map(t => String(t).trim().toLowerCase()).filter(Boolean))
 })
 
@@ -241,12 +264,36 @@ const parsedNodes = computed<ParsedNode[]>(() => {
   }
   return []
 })
+const paragraphProbeNode = ref<ParsedNode | null>(null)
+const listItemProbeNode = ref<ParsedNode | null>(null)
+const listProbeNode = ref<ParsedNode | null>(null)
+const headingProbeNodes = ref<Record<number, ParsedNode | null> | null>(null)
+const isNestedListItemRenderer = props.indexKey != null && String(props.indexKey).startsWith('list-item-')
+const initialHeightExperimentConfig = (!isNestedListItemRenderer && props.customId)
+  ? getHeightEstimationExperiment(props.customId)
+  : null
+const heightExperimentConfig = computed(() => {
+  if (!initialHeightExperimentConfig)
+    return null
+  void heightEstimationExperimentRevision.value
+  return getHeightEstimationExperiment(props.customId)
+})
+const heightExperimentEnabled = computed(() => Boolean(
+  isClient
+  && props.customId
+  && !isNestedListItemRenderer
+  && heightExperimentConfig.value?.enabled,
+))
+const textEstimationEnabled = computed(() => heightExperimentEnabled.value && heightExperimentConfig.value?.textEstimation !== false)
+const codeBlockEstimationEnabled = computed(() => heightExperimentEnabled.value && heightExperimentConfig.value?.codeBlockEstimation !== false)
+const experimentProbeWidth = computed(() => Math.max(320, experimentContainerWidth.value || containerRef.value?.clientWidth || 640))
 const maxLiveNodesResolved = computed(() => Math.max(1, props.maxLiveNodes ?? 320))
 const virtualizationEnabled = computed(() => {
   if ((props.maxLiveNodes ?? 0) <= 0)
     return false
   return parsedNodes.value.length > maxLiveNodesResolved.value
 })
+const shouldMeasureNodeHeights = computed(() => virtualizationEnabled.value || heightExperimentEnabled.value)
 // Viewport priority is used to defer heavy work (Monaco/Mermaid/KaTeX) until
 // nodes approach the viewport. Node-level deferral is controlled separately
 // via `deferNodes`.
@@ -268,9 +315,10 @@ const requestFrame = isClient && typeof window.requestAnimationFrame === 'functi
 const cancelFrame = isClient && typeof window.cancelAnimationFrame === 'function'
   ? window.cancelAnimationFrame.bind(window)
   : null
-const isTestEnv = typeof globalThis !== 'undefined'
-  && typeof (globalThis as any).process !== 'undefined'
-  && (globalThis as any).process?.env?.NODE_ENV === 'test'
+const processEnv = typeof globalThis !== 'undefined' && 'process' in globalThis
+  ? (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env
+  : undefined
+const isTestEnv = processEnv?.NODE_ENV === 'test'
 const hasIdleCallback = isClient && typeof window.requestIdleCallback === 'function'
 const resolvedBatchSize = computed(() => {
   const size = Math.trunc(props.renderBatchSize ?? 80)
@@ -294,6 +342,7 @@ const nodeVisibilityHandles = new Map<number, VisibilityHandle>()
 const nodeVisibilityWatchStops = new Map<number, () => void>()
 const nodeVisibilityFallbackTimers = new Map<number, number>()
 const nodeSlotElements = new Map<number, HTMLElement | null>()
+const nodeContentResizeObservers = new Map<number, ResizeObserver>()
 const codeBlockRenderCache = new WeakMap<object, { signature: string, node: ParsedNode }>()
 const nodeSlotVersion = ref(0)
 const sortedNodeSlots = computed(() => {
@@ -305,6 +354,9 @@ const heightTreeSize = ref(0)
 const heightSumTree = ref<number[]>([])
 const heightKnownTree = ref<number[]>([])
 const scrollRootElement = ref<HTMLElement | null>(null)
+const activeRestoreAnchor = ref<{ nodeIndex: number, offsetWithinNodePx: number } | null>(null)
+let restoreReconcileRaf: number | null = null
+let restoreReconcileTimers: number[] = []
 let detachScrollHandler: (() => void) | null = null
 let pendingFocusSync: { id: number | ReturnType<typeof setTimeout>, viaTimeout: boolean } | null = null
 const deferNodes = computed(() => {
@@ -335,6 +387,7 @@ const liveNodeBufferResolved = computed(() => Math.max(0, props.liveNodeBuffer ?
 const focusIndex = ref(0)
 const liveRange = reactive({ start: 0, end: 0 })
 const nodeContentElements = new Map<number, HTMLElement | null>()
+const nodeContentDeferredMeasureTimers = new Map<number, number[]>()
 const desiredRenderedCount = computed(() => {
   if (!virtualizationEnabled.value)
     return parsedNodes.value.length
@@ -343,6 +396,54 @@ const desiredRenderedCount = computed(() => {
   const target = Math.min(parsedNodes.value.length, windowEnd)
   return Math.max(renderedCount.value, target)
 })
+
+function ensureExperimentProbeNodes() {
+  if (paragraphProbeNode.value && listItemProbeNode.value && listProbeNode.value && headingProbeNodes.value?.[1])
+    return
+
+  const paragraph = markRaw({
+    type: 'paragraph',
+    children: [{ type: 'text', content: 'Probe paragraph text', raw: 'Probe paragraph text' }],
+    raw: 'Probe paragraph text',
+  }) as ParsedNode
+  const listItem = markRaw({
+    type: 'list_item',
+    children: [paragraph],
+    raw: '- Probe paragraph text',
+  }) as ParsedNode
+  const list = markRaw({
+    type: 'list',
+    ordered: false,
+    items: [listItem],
+    raw: '- Probe paragraph text',
+  }) as ParsedNode
+
+  paragraphProbeNode.value = paragraph
+  listItemProbeNode.value = listItem
+  listProbeNode.value = list
+  const headings: Record<number, ParsedNode | null> = {
+    1: null,
+    2: null,
+    3: null,
+    4: null,
+    5: null,
+    6: null,
+  }
+  for (let level = 1; level <= 6; level++) {
+    headings[level] = markRaw({
+      type: 'heading',
+      level,
+      text: 'Probe heading',
+      children: [{ type: 'text', content: 'Probe heading', raw: 'Probe heading' }],
+      raw: `${'#'.repeat(level)} Probe heading`,
+    }) as ParsedNode
+  }
+  headingProbeNodes.value = headings
+}
+
+function getHeadingProbeNode(level: number) {
+  return headingProbeNodes.value?.[level] ?? null
+}
 
 function resolveScrollContainer(node?: HTMLElement | null) {
   const resolved = resolveViewportRoot(node ?? containerRef.value ?? null)
@@ -649,11 +750,267 @@ function recordNodeHeight(index: number, height: number) {
       }
     }
   }
+  if (activeRestoreAnchor.value)
+    scheduleRestoreReconcile()
 }
 
 const averageNodeHeight = computed(() => {
   return heightStats.count > 0 ? Math.max(12, heightStats.total / heightStats.count) : 32
 })
+
+function getProbeRoot(wrapper: HTMLElement | null | undefined) {
+  return wrapper?.firstElementChild as HTMLElement | null
+}
+
+function getProbeElement(root: HTMLElement | null | undefined, selector: string) {
+  if (!root)
+    return null
+  if (root.matches?.(selector))
+    return root
+  return root.querySelector(selector) as HTMLElement | null
+}
+
+function setHeadingProbeWrapper(level: number, el: HTMLElement | null) {
+  if (level < 1 || level > 6)
+    return
+  headingProbeWrapperRefs[level] = el
+}
+
+function readSimpleTextProbeProfile() {
+  if (!heightExperimentEnabled.value || typeof window === 'undefined') {
+    simpleTextProbeProfile.value = createEmptySimpleTextProbeProfile()
+    return
+  }
+
+  const nextProfile = createEmptySimpleTextProbeProfile()
+  const paragraphRoot = getProbeRoot(paragraphProbeWrapperRef.value)
+  const paragraphTextEl = getProbeElement(paragraphRoot, '.paragraph-node')
+  nextProfile.paragraph = buildBlockTextProfile(paragraphProbeWrapperRef.value, paragraphTextEl, 'pre-wrap')
+
+  const listItemRoot = getProbeRoot(listItemProbeWrapperRef.value)
+  const listItemTextEl = listItemRoot?.querySelector('.paragraph-node') as HTMLElement | null
+  nextProfile.listItem = buildBlockTextProfile(listItemProbeWrapperRef.value, listItemTextEl, 'pre-wrap')
+
+  const listHeight = listProbeWrapperRef.value?.offsetHeight ?? 0
+  const listItemHeight = listItemProbeWrapperRef.value?.offsetHeight ?? 0
+  nextProfile.listWrapperOverhead = Math.max(0, listHeight - listItemHeight)
+
+  for (let level = 1; level <= 6; level++) {
+    const headingRoot = getProbeRoot(headingProbeWrapperRefs[level])
+    const headingTextEl = getProbeElement(headingRoot, `h${level}`)
+    nextProfile.headings[level] = buildBlockTextProfile(headingProbeWrapperRefs[level], headingTextEl, 'pre-wrap')
+  }
+
+  simpleTextProbeProfile.value = nextProfile
+}
+
+function updateExperimentContainerWidth() {
+  if (!heightExperimentEnabled.value) {
+    experimentContainerWidth.value = 0
+    return
+  }
+  const width = containerRef.value?.clientWidth ?? 0
+  experimentContainerWidth.value = width > 0 ? width : 0
+}
+
+let experimentResizeObserver: ResizeObserver | null = null
+
+function cleanupExperimentResizeObserver() {
+  experimentResizeObserver?.disconnect()
+  experimentResizeObserver = null
+}
+
+function setupExperimentResizeObserver() {
+  cleanupExperimentResizeObserver()
+  if (!heightExperimentEnabled.value || !containerRef.value || typeof ResizeObserver === 'undefined')
+    return
+  experimentResizeObserver = new ResizeObserver(() => {
+    updateExperimentContainerWidth()
+    if (activeRestoreAnchor.value)
+      scheduleRestoreReconcile()
+  })
+  experimentResizeObserver.observe(containerRef.value)
+}
+
+// 异步按需加载 CodeBlock 组件；失败时退回为 InlineCodeNode（内联代码渲染）
+const CodeBlockNodeAsync = defineAsyncComponent(async () => {
+  try {
+    const mod = await import('../../components/CodeBlockNode/CodeBlockNode.vue')
+    return mod.default
+  }
+  catch (e) {
+    console.warn(
+      '[markstream-vue] Optional peer dependencies for CodeBlockNode are missing. Falling back to inline-code rendering (no Monaco). To enable full code block features, please install "stream-monaco".',
+      e,
+    )
+    return PreCodeNode
+  }
+})
+
+const codeBlockComponent = computed(() => props.renderCodeBlocksAsPre ? PreCodeNode : CodeBlockNodeAsync)
+
+function resolveCodeBlockRendererKind(node: ParsedNode) {
+  if (node.type !== 'code_block')
+    return null
+  const component = getNodeComponent(node, getCodeBlockLanguage(node))
+  if (component === MarkdownCodeBlockNode)
+    return 'markdown'
+  if (component === PreCodeNode)
+    return 'pre'
+  if (component === codeBlockComponent.value || component === CodeBlockNodeAsync)
+    return 'monaco'
+  return null
+}
+
+function resolveCodeBlockShowHeader() {
+  const showHeader = props.codeBlockProps?.showHeader
+  return showHeader !== false
+}
+
+const estimatedNodeHeights = computed(() => {
+  const nodes = parsedNodes.value
+  if (!nodes.length || !heightExperimentEnabled.value)
+    return nodes.map(() => null)
+
+  const width = experimentContainerWidth.value || containerRef.value?.clientWidth || 0
+  if (!Number.isFinite(width) || width <= 0)
+    return nodes.map(() => null)
+
+  return nodes.map((node, index) => {
+    const measuredHeight = nodeHeights[index]
+    const hasMeasuredHeight = typeof measuredHeight === 'number' && measuredHeight > 0
+
+    if (textEstimationEnabled.value && !hasMeasuredHeight) {
+      const estimatedText = estimateSimpleTextBlockHeight(node, width, simpleTextProbeProfile.value)
+      if (estimatedText)
+        return estimatedText
+    }
+
+    if (codeBlockEstimationEnabled.value && node.type === 'code_block') {
+      const rendererKind = resolveCodeBlockRendererKind(node)
+      if (rendererKind === 'monaco' || rendererKind === 'markdown') {
+        return estimateCodeBlockHeight(node, {
+          rendererKind,
+          monacoOptions: props.codeBlockMonacoOptions,
+          showHeader: resolveCodeBlockShowHeader(),
+        })
+      }
+    }
+
+    return null
+  })
+})
+
+function getFallbackNodeHeight(index: number) {
+  return nodeHeights[index] ?? estimatedNodeHeights.value[index]?.height ?? averageNodeHeight.value
+}
+
+function getRelativeScrollTopWithinContainer() {
+  const root = scrollRootElement.value || resolveScrollContainer()
+  const container = containerRef.value
+  if (!root || !container)
+    return null
+  const doc = root.ownerDocument || container.ownerDocument || document
+  const isViewportRoot = root === doc.documentElement || root === doc.body || root === doc.scrollingElement
+  if (isViewportRoot) {
+    const containerRect = container.getBoundingClientRect()
+    return Math.max(0, -containerRect.top)
+  }
+  return Math.max(0, getNormalizedScrollTop(root, doc, false) - getOffsetTopWithinRoot(container, root))
+}
+
+function setRelativeScrollTopWithinContainer(target: number) {
+  const root = scrollRootElement.value || resolveScrollContainer()
+  const container = containerRef.value
+  if (!root || !container)
+    return
+  const next = Math.max(0, target)
+  const doc = root.ownerDocument || container.ownerDocument || document
+  const view = doc.defaultView || (typeof window !== 'undefined' ? window : null)
+  const isViewportRoot = root === doc.documentElement || root === doc.body || root === doc.scrollingElement
+  if (isViewportRoot) {
+    const current = getNormalizedScrollTop(root, doc, true)
+    const containerDocTop = current + container.getBoundingClientRect().top
+    view?.scrollTo?.(0, Math.max(0, containerDocTop + next))
+    return
+  }
+  root.scrollTop = getOffsetTopWithinRoot(container, root) + next
+}
+
+function resolveAnchorOffset(anchor: { nodeIndex: number, offsetWithinNodePx: number }) {
+  const boundedIndex = clamp(anchor.nodeIndex, 0, Math.max(0, parsedNodes.value.length - 1))
+  return estimateHeightRange(0, boundedIndex) + Math.max(0, anchor.offsetWithinNodePx)
+}
+
+function clearRestoreReconcile() {
+  if (restoreReconcileRaf != null) {
+    cancelFrame?.(restoreReconcileRaf)
+    restoreReconcileRaf = null
+  }
+  if (isClient) {
+    for (const timer of restoreReconcileTimers)
+      window.clearTimeout(timer)
+  }
+  restoreReconcileTimers = []
+}
+
+function applyRestoreAnchor(anchor: { nodeIndex: number, offsetWithinNodePx: number }) {
+  setRelativeScrollTopWithinContainer(resolveAnchorOffset(anchor))
+}
+
+function scheduleRestoreReconcile() {
+  if (!activeRestoreAnchor.value || !isClient)
+    return
+  if (restoreReconcileRaf != null)
+    return
+  restoreReconcileRaf = requestFrame
+    ? requestFrame(() => {
+        restoreReconcileRaf = null
+        if (activeRestoreAnchor.value)
+          applyRestoreAnchor(activeRestoreAnchor.value)
+      })
+    : null
+  if (restoreReconcileRaf == null && activeRestoreAnchor.value)
+    applyRestoreAnchor(activeRestoreAnchor.value)
+}
+
+function captureRestoreAnchor() {
+  const relativeScrollTop = getRelativeScrollTopWithinContainer()
+  const total = parsedNodes.value.length
+  if (relativeScrollTop == null || total <= 0)
+    return null
+  const nodeIndex = clamp(estimateIndexForOffset(relativeScrollTop + 1), 0, total - 1)
+  const nodeStart = estimateHeightRange(0, nodeIndex)
+  const nodeHeight = getFallbackNodeHeight(nodeIndex)
+  return {
+    nodeIndex,
+    offsetWithinNodePx: clamp(relativeScrollTop - nodeStart, 0, Math.max(0, nodeHeight - 1)),
+  }
+}
+
+function restoreAnchor(anchor: { nodeIndex: number, offsetWithinNodePx: number }) {
+  activeRestoreAnchor.value = {
+    nodeIndex: clamp(anchor.nodeIndex, 0, Math.max(0, parsedNodes.value.length - 1)),
+    offsetWithinNodePx: Math.max(0, anchor.offsetWithinNodePx),
+  }
+  clearRestoreReconcile()
+  applyRestoreAnchor(activeRestoreAnchor.value)
+  if (!isClient)
+    return
+  for (const delay of [0, 120, 280, 480]) {
+    restoreReconcileTimers.push(window.setTimeout(() => {
+      if (activeRestoreAnchor.value)
+        applyRestoreAnchor(activeRestoreAnchor.value)
+    }, delay))
+  }
+}
+
+function getAnchorDrift(anchor: { nodeIndex: number, offsetWithinNodePx: number }) {
+  const relativeScrollTop = getRelativeScrollTopWithinContainer()
+  if (relativeScrollTop == null)
+    return null
+  return relativeScrollTop - resolveAnchorOffset(anchor)
+}
 
 watch(
   () => parsedNodes.value.length,
@@ -673,6 +1030,12 @@ watch(
 function estimateHeightRange(start: number, end: number) {
   if (start >= end)
     return 0
+  if (heightExperimentEnabled.value) {
+    let total = 0
+    for (let i = start; i < end; i++)
+      total += getFallbackNodeHeight(i)
+    return total
+  }
   if (heightTreeSize.value !== parsedNodes.value.length) {
     let total = 0
     for (let i = start; i < end; i++)
@@ -727,10 +1090,51 @@ const bottomSpacerHeight = computed(() => {
   return estimateHeightRange(end, total)
 })
 
+function buildExperimentReport() {
+  const nodes = parsedNodes.value
+  return {
+    totalNodes: nodes.length,
+    measuredCount: heightStats.count,
+    estimatedCount: estimatedNodeHeights.value.filter(Boolean).length,
+    averageNodeHeight: averageNodeHeight.value,
+    topSpacerHeight: topSpacerHeight.value,
+    bottomSpacerHeight: bottomSpacerHeight.value,
+    estimatedTotalHeight: estimateHeightRange(0, nodes.length),
+    width: experimentContainerWidth.value || containerRef.value?.clientWidth || 0,
+    probe: {
+      paragraphReady: Boolean(simpleTextProbeProfile.value.paragraph),
+      listItemReady: Boolean(simpleTextProbeProfile.value.listItem),
+      listWrapperOverhead: simpleTextProbeProfile.value.listWrapperOverhead,
+      headingReadyLevels: Object.entries(simpleTextProbeProfile.value.headings)
+        .filter(([, value]) => Boolean(value))
+        .map(([level]) => Number(level)),
+    },
+    nodes: nodes.map((node, index) => ({
+      index,
+      type: node.type,
+      estimateKind: estimatedNodeHeights.value[index]?.kind ?? null,
+      rendererKind: estimatedNodeHeights.value[index]?.rendererKind ?? null,
+      estimatedHeight: estimatedNodeHeights.value[index]?.height ?? null,
+      estimatedContentHeight: estimatedNodeHeights.value[index]?.contentHeight ?? null,
+      measuredHeight: nodeHeights[index] ?? null,
+    })),
+  }
+}
+
 function estimateIndexForOffset(offsetPx: number) {
   if (offsetPx <= 0)
     return 0
   const nodes = parsedNodes.value
+  if (heightExperimentEnabled.value) {
+    let remaining = offsetPx
+    for (let i = 0; i < nodes.length; i++) {
+      const height = getFallbackNodeHeight(i)
+      if (remaining <= height)
+        return i
+      remaining -= height
+    }
+    return Math.max(0, nodes.length - 1)
+  }
   if (heightTreeSize.value === nodes.length && heightSumTree.value.length && heightKnownTree.value.length) {
     const avg = averageNodeHeight.value
     const sumTree = heightSumTree.value
@@ -774,6 +1178,16 @@ function estimateIndexForOffsetFromEnd(offsetPx: number) {
     return 0
   if (offsetPx <= 0)
     return Math.max(0, nodes.length - 1)
+  if (heightExperimentEnabled.value) {
+    let remaining = offsetPx
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const height = getFallbackNodeHeight(i)
+      if (remaining <= height)
+        return i
+      remaining -= height
+    }
+    return 0
+  }
   if (heightTreeSize.value === nodes.length) {
     const totalHeight = estimateHeightRange(0, nodes.length)
     const target = Math.max(0, totalHeight - offsetPx)
@@ -968,15 +1382,59 @@ function setNodeSlotElement(index: number, el: HTMLElement | null) {
 }
 
 function setNodeContentRef(index: number, el: HTMLElement | null) {
-  if (!el) {
+  const previousTimers = nodeContentDeferredMeasureTimers.get(index)
+  if (previousTimers) {
+    for (const id of previousTimers)
+      window.clearTimeout(id)
+    nodeContentDeferredMeasureTimers.delete(index)
+  }
+  const previousObserver = nodeContentResizeObservers.get(index)
+  if (previousObserver) {
+    previousObserver.disconnect()
+    nodeContentResizeObservers.delete(index)
+  }
+  if (!el || !shouldMeasureNodeHeights.value) {
     nodeContentElements.delete(index)
     return
   }
   nodeContentElements.set(index, el)
-  queueMicrotask(() => {
+  const measure = () => {
     recordNodeHeight(index, el.offsetHeight)
-  })
+  }
+  queueMicrotask(measure)
+  if (typeof ResizeObserver !== 'undefined') {
+    const observer = new ResizeObserver(() => {
+      measure()
+    })
+    observer.observe(el)
+    nodeContentResizeObservers.set(index, observer)
+  }
+  if (parsedNodes.value[index]?.type === 'code_block' && typeof window !== 'undefined') {
+    nodeContentDeferredMeasureTimers.set(index, [
+      window.setTimeout(measure, 16),
+      window.setTimeout(measure, 80),
+      window.setTimeout(measure, 240),
+      window.setTimeout(measure, 800),
+    ])
+  }
 }
+
+watch(
+  () => shouldMeasureNodeHeights.value,
+  (enabled) => {
+    if (enabled)
+      return
+    for (const observer of nodeContentResizeObservers.values())
+      observer.disconnect()
+    nodeContentResizeObservers.clear()
+    for (const timers of nodeContentDeferredMeasureTimers.values()) {
+      for (const id of timers)
+        window.clearTimeout(id)
+    }
+    nodeContentDeferredMeasureTimers.clear()
+  },
+  { immediate: true },
+)
 
 let batchRaf: number | null = null
 let batchTimeout: number | null = null
@@ -1288,11 +1746,59 @@ watch(
 )
 
 watch(
+  heightExperimentEnabled,
+  (enabled) => {
+    if (!enabled)
+      return
+    ensureExperimentProbeNodes()
+  },
+  { immediate: true },
+)
+
+watch(
+  [() => containerRef.value, heightExperimentEnabled],
+  () => {
+    if (!heightExperimentEnabled.value) {
+      cleanupExperimentResizeObserver()
+      experimentContainerWidth.value = 0
+      return
+    }
+    updateExperimentContainerWidth()
+    setupExperimentResizeObserver()
+  },
+  { immediate: true },
+)
+
+watch(
+  [heightExperimentEnabled, experimentProbeWidth],
+  async () => {
+    if (!heightExperimentEnabled.value) {
+      simpleTextProbeProfile.value = createEmptySimpleTextProbeProfile()
+      return
+    }
+    await nextTick()
+    readSimpleTextProbeProfile()
+  },
+  { flush: 'post', immediate: true },
+)
+
+watch(
   () => parsedNodes.value.length,
   () => {
     if (virtualizationEnabled.value)
       scheduleFocusSync({ immediate: true })
   },
+)
+
+watch(
+  [heightExperimentEnabled, experimentContainerWidth],
+  () => {
+    if (virtualizationEnabled.value)
+      scheduleFocusSync({ immediate: true })
+    if (activeRestoreAnchor.value)
+      scheduleRestoreReconcile()
+  },
+  { immediate: false },
 )
 
 watch(
@@ -1388,33 +1894,46 @@ watch(
   },
 )
 
+watch(
+  [() => props.customId],
+  ([customId], _prev, onCleanup) => {
+    if (!customId || isNestedListItemRenderer)
+      return
+    const cleanup = registerHeightEstimationRendererController(customId, {
+      captureRestoreAnchor,
+      restoreAnchor,
+      getAnchorDrift,
+      getReport: buildExperimentReport,
+    })
+    onCleanup(() => {
+      cleanup()
+    })
+  },
+  { immediate: true },
+)
+
 onBeforeUnmount(() => {
   cancelBatchTimers()
   for (const handle of nodeVisibilityHandles.values())
     handle.destroy()
   nodeVisibilityHandles.clear()
+  for (const observer of nodeContentResizeObservers.values())
+    observer.disconnect()
+  nodeContentResizeObservers.clear()
+  for (const timers of nodeContentDeferredMeasureTimers.values()) {
+    for (const id of timers)
+      window.clearTimeout(id)
+  }
+  nodeContentDeferredMeasureTimers.clear()
   for (const stopWatchingVisibility of nodeVisibilityWatchStops.values())
     stopWatchingVisibility()
   nodeVisibilityWatchStops.clear()
   for (const index of Array.from(nodeVisibilityFallbackTimers.keys()))
     clearVisibilityFallback(index)
+  cleanupExperimentResizeObserver()
+  clearRestoreReconcile()
   cleanupScrollListener()
   cancelScheduledFocusSync()
-})
-
-// 异步按需加载 CodeBlock 组件；失败时退回为 InlineCodeNode（内联代码渲染）
-const CodeBlockNodeAsync = defineAsyncComponent(async () => {
-  try {
-    const mod = await import('../../components/CodeBlockNode')
-    return mod.default
-  }
-  catch (e) {
-    console.warn(
-      '[markstream-vue] Optional peer dependencies for CodeBlockNode are missing. Falling back to inline-code rendering (no Monaco). To enable full code block features, please install "stream-monaco".',
-      e,
-    )
-    return PreCodeNode
-  }
 })
 
 const MermaidBlockNodeAsync = defineAsyncComponent(async () => {
@@ -1460,8 +1979,7 @@ const D2BlockNodeAsync = defineAsyncComponent(async () => {
 })
 
 // 组件映射表
-const codeBlockComponent = computed(() => props.renderCodeBlocksAsPre ? PreCodeNode : CodeBlockNodeAsync)
-const nodeComponents = {
+const nodeComponents: Partial<CustomComponents> = {
   text: TextNode,
   paragraph: ParagraphNode,
   heading: HeadingNode,
@@ -1499,10 +2017,6 @@ const nodeComponents = {
   // 可以添加更多节点类型
   // 例如:custom_node: CustomNode,
 }
-const customComponentsMap = computed(() => {
-  void customComponentsRevision.value
-  return getCustomNodeComponents(props.customId)
-})
 const indexPrefix = computed(() => (props.indexKey != null ? String(props.indexKey) : 'markdown-renderer'))
 const codeBlockBindings = computed(() => ({
   // streaming behavior control for CodeBlockNode
@@ -1529,6 +2043,8 @@ const nonCodeBindings = computed(() => ({
   // Forward `typewriter` flag to non-code node components so they can
   // opt in/out of enter transitions or other typewriter-like behaviour.
   typewriter: props.typewriter,
+  // Forward customHtmlTags for non-whitelisted tag detection in child components
+  customHtmlTags: mergedParseOptions.value.customHtmlTags,
 }))
 const linkBindings = computed(() => ({
   ...nonCodeBindings.value,
@@ -1543,7 +2059,7 @@ function getCodeBlockRenderNode(node: ParsedNode) {
   if (node.type !== 'code_block')
     return node
 
-  const codeBlockNode = node as any
+  const codeBlockNode = node as RuntimeCodeBlockNode
   const signature = [
     String(codeBlockNode.language ?? ''),
     String(codeBlockNode.loading ?? ''),
@@ -1579,22 +2095,55 @@ const renderedItems = computed(() => {
     // but the tag references a known custom component.
     if (
       (node.type === 'html_block' || node.type === 'html_inline')
-      && component === (nodeComponents as any)[node.type]
+      && component === nodeComponents[node.type]
     ) {
-      const tag = String((node as any).tag ?? '').trim().toLowerCase()
-        || getHtmlTagFromContent((node as any).content)
-      if (tag && effectiveCustomHtmlTagsSet.value.has(tag)) {
+      const htmlNode = node as RuntimeHtmlNode
+      const tag = String(htmlNode.tag ?? '').trim().toLowerCase()
+        || getHtmlTagFromContent(htmlNode.content)
+      if (tag) {
         const customComponents = customComponentsMap.value
-        const customForTag = (customComponents as any)[tag]
-        if (customForTag) {
+        const customForTag = customComponents[tag]
+
+        // Check if tag is whitelisted in customHtmlTags
+        if (effectiveCustomHtmlTagsSet.value.has(tag) && customForTag) {
           component = customForTag
           node = {
-            ...(node as any),
+            ...htmlNode,
             type: tag,
             tag,
-            content: stripCustomHtmlWrapper((node as any).content, tag),
+            content: stripCustomHtmlWrapper(htmlNode.content, tag),
           } as ParsedNode
         }
+        else if (shouldRenderUnknownHtmlTagAsText(htmlNode.content ?? htmlNode.raw, tag)) {
+          const rawContent = String(htmlNode.content ?? htmlNode.raw ?? '')
+
+          if (node.type === 'html_inline') {
+            component = TextNode
+            node = {
+              type: 'text',
+              content: rawContent,
+              raw: rawContent,
+            } as ParsedNode
+          }
+          else {
+            component = ParagraphNode
+            node = {
+              type: 'paragraph',
+              children: [{ type: 'text', content: rawContent, raw: rawContent }],
+              raw: rawContent,
+            } as ParsedNode
+          }
+        }
+      }
+    }
+
+    let bindings = { ...getBindingsFor(node, language) } as Record<string, unknown>
+    const estimatedHeight = estimatedNodeHeights.value[item.index]
+    if (node.type === 'code_block' && estimatedHeight?.kind === 'code-block') {
+      bindings = {
+        ...bindings,
+        estimatedHeightPx: estimatedHeight.height,
+        estimatedContentHeightPx: estimatedHeight.contentHeight,
       }
     }
 
@@ -1602,33 +2151,16 @@ const renderedItems = computed(() => {
       ...item,
       node,
       component,
-      bindings: getBindingsFor(node, language),
+      bindings,
       isCodeBlock: node.type === 'code_block',
       indexKey: `${indexPrefix.value}-${item.index}`,
     }
   })
 })
 
-function getHtmlTagFromContent(html: unknown) {
-  const raw = String(html ?? '')
-  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-function stripCustomHtmlWrapper(html: unknown, tag: string) {
-  const raw = String(html ?? '')
-  if (!tag)
-    return raw
-  // Escape special regex characters to prevent unexpected behavior.
-  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const openRe = new RegExp(String.raw`^\s*<\s*${escaped}(?:\s[^>]*)?>\s*`, 'i')
-  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${escaped}\s*>\s*$`, 'i')
-  return raw.replace(openRe, '').replace(closeRe, '')
-}
-
 function getCodeBlockLanguage(node: ParsedNode) {
   return node?.type === 'code_block'
-    ? String((node as any).language ?? '').trim().toLowerCase()
+    ? String((node as RuntimeCodeBlockNode).language ?? '').trim().toLowerCase()
     : ''
 }
 
@@ -1639,25 +2171,25 @@ function getNodeComponent(node: ParsedNode, language?: string) {
   if (!node)
     return FallbackComponent
   const customComponents = customComponentsMap.value
-  const customForType = (customComponents as any)[String((node as any).type)]
+  const customForType = customComponents[String(node.type)]
   if (node.type === 'code_block') {
     const lang = language ?? getCodeBlockLanguage(node)
     // Keep Mermaid blocks routed to MermaidBlockNode unless a specific
     // `mermaid` override is provided.
     if (lang === 'mermaid') {
-      const customMermaid = (customComponents as any).mermaid
+      const customMermaid = customComponents.mermaid
       return customMermaid || MermaidBlockNodeAsync
     }
 
     // Keep Infographic blocks routed to InfographicBlockNode unless a specific
     // `infographic` override is provided.
     if (lang === 'infographic') {
-      const customInfographic = (customComponents as any).infographic
+      const customInfographic = customComponents.infographic
       return customInfographic || InfographicBlockNodeAsync
     }
 
     if (lang === 'd2' || lang === 'd2lang') {
-      const customD2 = (customComponents as any).d2
+      const customD2 = customComponents.d2
       return customD2 || D2BlockNodeAsync
     }
 
@@ -1666,7 +2198,7 @@ function getNodeComponent(node: ParsedNode, language?: string) {
 
     // Honor a custom `code_block` component if the consumer registered one
     // via `setCustomComponents(customId, { code_block: MyComponent })`.
-    const customCodeBlock = (customComponents as any).code_block
+    const customCodeBlock = customComponents.code_block
     if (customCodeBlock)
       return customCodeBlock
 
@@ -1676,7 +2208,7 @@ function getNodeComponent(node: ParsedNode, language?: string) {
   if (customForType)
     return customForType
 
-  return (nodeComponents as any)[String((node as any).type)] || FallbackComponent
+  return nodeComponents[String(node.type)] || FallbackComponent
 }
 
 function getBindingsFor(node: ParsedNode, language?: string) {
@@ -1730,12 +2262,53 @@ function handleContainerMouseout(event: MouseEvent) {
     @mouseover="handleContainerMouseover"
     @mouseout="handleContainerMouseout"
   >
-    <div
-      v-if="virtualizationEnabled"
-      class="node-spacer"
-      :style="{ height: `${topSpacerHeight}px` }"
-      aria-hidden="true"
-    />
+    <template v-if="heightExperimentEnabled || virtualizationEnabled">
+      <div
+        v-if="heightExperimentEnabled"
+        class="height-estimation-probes"
+        :style="{ width: `${experimentProbeWidth}px` }"
+        aria-hidden="true"
+      >
+        <div ref="paragraphProbeWrapperRef" class="node-content" data-probe="paragraph">
+          <ParagraphNode
+            :node="paragraphProbeNode as any"
+            index-key="probe-paragraph"
+          />
+        </div>
+        <div ref="listItemProbeWrapperRef" class="node-content" data-probe="list-item">
+          <ul class="m-0 p-0">
+            <ListItemNode
+              :node="listItemProbeNode as any"
+              index-key="probe-list-item"
+            />
+          </ul>
+        </div>
+        <div ref="listProbeWrapperRef" class="node-content" data-probe="list">
+          <ListNode
+            :node="listProbeNode as any"
+            index-key="probe-list"
+          />
+        </div>
+        <div
+          v-for="level in 6"
+          :key="`probe-heading-${level}`"
+          :ref="el => setHeadingProbeWrapper(level, el as HTMLElement | null)"
+          class="node-content"
+          :data-probe="`heading-${level}`"
+        >
+          <HeadingNode
+            :node="getHeadingProbeNode(level) as any"
+            :index-key="`probe-heading-${level}`"
+          />
+        </div>
+      </div>
+      <div
+        v-if="virtualizationEnabled"
+        class="node-spacer"
+        :style="{ height: `${topSpacerHeight}px` }"
+        aria-hidden="true"
+      />
+    </template>
     <template v-for="item in renderedItems" :key="item.index">
       <div
         :ref="el => setNodeSlotElement(item.index, el as HTMLElement | null)"
@@ -1783,7 +2356,7 @@ function handleContainerMouseout(event: MouseEvent) {
         <div
           v-else
           class="node-placeholder"
-          :style="{ height: `${nodeHeights[item.index] ?? averageNodeHeight}px` }"
+          :style="{ height: `${getFallbackNodeHeight(item.index)}px` }"
         />
       </div>
     </template>
@@ -1815,6 +2388,16 @@ function handleContainerMouseout(event: MouseEvent) {
   contain-intrinsic-size: auto;
 }
 
+.height-estimation-probes {
+  position: absolute;
+  left: -100000px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: -1;
+}
+
 .node-slot {
   width: 100%;
 }
@@ -1827,8 +2410,8 @@ function handleContainerMouseout(event: MouseEvent) {
   width: 100%;
   min-height: 1rem;
   margin: 0.25rem 0;
-  border-radius: 0.5rem;
-  background-image: linear-gradient(90deg, rgba(148, 163, 184, 0.18), rgba(148, 163, 184, 0.05), rgba(148, 163, 184, 0.18));
+  border-radius: var(--ms-radius);
+  background-image: linear-gradient(90deg, var(--loading-shimmer), transparent, var(--loading-shimmer));
   background-size: 200% 100%;
   animation: node-placeholder-shimmer 1.1s ease-in-out infinite;
 }
@@ -1851,9 +2434,9 @@ function handleContainerMouseout(event: MouseEvent) {
 }
 
 .unknown-node {
-  color: #6a737d;
+  color: hsl(var(--ms-muted-foreground));
   font-style: italic;
-  margin: 1rem 0;
+  margin: var(--ms-flow-paragraph-y) 0;
 }
 </style>
 

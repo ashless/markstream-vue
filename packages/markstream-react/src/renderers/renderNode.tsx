@@ -1,6 +1,7 @@
 import type { ParsedNode } from 'stream-markdown-parser'
 import type { RenderContext } from '../types'
 import React from 'react'
+import { getHtmlTagFromContent, shouldRenderUnknownHtmlTagAsText, stripCustomHtmlWrapper } from 'stream-markdown-parser'
 import { AdmonitionNode } from '../components/AdmonitionNode/AdmonitionNode'
 import { BlockquoteNode } from '../components/BlockquoteNode/BlockquoteNode'
 import { CheckboxNode } from '../components/CheckboxNode/CheckboxNode'
@@ -40,23 +41,9 @@ import { TextNode } from '../components/TextNode/TextNode'
 import { ThematicBreakNode } from '../components/ThematicBreakNode/ThematicBreakNode'
 import { VmrContainerNode } from '../components/VmrContainerNode/VmrContainerNode'
 import { getCustomNodeComponents } from '../customComponents'
+import { resolveCustomHtmlTag } from '../utils/customHtmlTag'
 import { normalizeLanguageIdentifier } from '../utils/languageIcon'
 import { renderNodeChildren } from './renderChildren'
-
-function getHtmlTagFromContent(html: unknown) {
-  const raw = String(html ?? '')
-  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-function stripCustomHtmlWrapper(html: unknown, tag: string) {
-  const raw = String(html ?? '')
-  if (!tag)
-    return raw
-  const openRe = new RegExp(String.raw`^\s*<\s*${tag}(?:\s[^>]*)?>\s*`, 'i')
-  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${tag}\s*>\s*$`, 'i')
-  return raw.replace(openRe, '').replace(closeRe, '')
-}
 
 function renderCodeBlock(
   node: any,
@@ -152,25 +139,39 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
   }
 
   if (node.type === 'html_block' || node.type === 'html_inline') {
-    const tag = String((node as any).tag ?? '').trim().toLowerCase() || getHtmlTagFromContent((node as any).content)
-    const customForTag = tag ? (customComponents as Record<string, any>)[tag] : null
-    if (customForTag) {
-      const coerced = {
-        ...(node as any),
-        type: tag,
-        tag,
-        content: stripCustomHtmlWrapper((node as any).content, tag),
+    const resolvedCustomTag = resolveCustomHtmlTag(node as any, customComponents as any, ctx.customHtmlTags)
+    const fallbackTag = String((node as any).tag ?? '').trim().toLowerCase() || getHtmlTagFromContent((node as any).content)
+    const tag = resolvedCustomTag?.tag ?? fallbackTag
+    if (tag) {
+      const customForTag = resolvedCustomTag?.component ?? (customComponents as Record<string, any>)[tag]
+      const isWhitelisted = resolvedCustomTag?.isWhitelisted ?? (ctx.customHtmlTags ?? []).some((t: string) => t.toLowerCase() === tag)
+      if (isWhitelisted && customForTag) {
+        const coerced = {
+          ...(node as any),
+          type: tag,
+          tag,
+          content: stripCustomHtmlWrapper((node as any).content, tag),
+        }
+        return React.createElement(customForTag as any, {
+          key,
+          node: coerced,
+          customId: ctx.customId,
+          isDark: ctx.isDark,
+          ctx,
+          renderNode,
+          indexKey: key,
+          typewriter: ctx.typewriter,
+        })
       }
-      return React.createElement(customForTag as any, {
-        key,
-        node: coerced,
-        customId: ctx.customId,
-        isDark: ctx.isDark,
-        ctx,
-        renderNode,
-        indexKey: key,
-        typewriter: ctx.typewriter,
-      })
+      const rawContent = String((node as any).content ?? (node as any).raw ?? '')
+      if (!isWhitelisted && shouldRenderUnknownHtmlTagAsText(rawContent, tag)) {
+        if (node.type === 'html_inline') {
+          return <TextNode key={key} node={{ type: 'text', content: rawContent, raw: rawContent } as any} ctx={ctx} indexKey={key} typewriter={ctx.typewriter} />
+        }
+        else {
+          return <ParagraphNode key={key} node={{ type: 'paragraph', children: [{ type: 'text', content: rawContent, raw: rawContent }], raw: rawContent } as any} ctx={ctx} renderNode={renderNode} indexKey={key} typewriter={ctx.typewriter} />
+        }
+      }
     }
   }
 
@@ -288,7 +289,7 @@ export function renderNode(node: ParsedNode, key: React.Key, ctx: RenderContext)
     case 'html_block':
     case 'html_inline':
       return node.type === 'html_block'
-        ? <HtmlBlockNode key={key} node={node as any} typewriter={ctx.typewriter} customId={ctx.customId} />
+        ? <HtmlBlockNode key={key} node={node as any} ctx={ctx} renderNode={renderNode} indexKey={key} typewriter={ctx.typewriter} customId={ctx.customId} />
         : <HtmlInlineNode key={key} node={node as any} typewriter={ctx.typewriter} customId={ctx.customId} />
     case 'vmr_container':
       return <VmrContainerNode key={key} node={node as any} ctx={ctx} renderNode={renderNode} indexKey={key} typewriter={ctx.typewriter} />

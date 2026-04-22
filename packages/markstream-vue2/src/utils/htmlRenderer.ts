@@ -1,15 +1,31 @@
+import type { HtmlToken } from 'stream-markdown-parser'
 import type { Component } from 'vue-demi'
+import {
+  BLOCKED_HTML_TAGS as BLOCKED_TAGS,
+  convertHtmlAttrsToProps,
+  convertHtmlPropValue,
+  getHtmlTagFromContent,
+  hasCompleteHtmlTagContent,
+  hasCustomHtmlComponents,
+  isCustomHtmlComponentTag,
+  sanitizeHtmlAttrs,
+  shouldRenderUnknownHtmlTagAsText,
+  stripCustomHtmlWrapper,
+  tokenizeHtml,
+} from 'stream-markdown-parser'
 import { h as vueH } from 'vue'
 import * as VueModule from 'vue-demi'
 import { h as demiH } from 'vue-demi'
 
-// HTML Parser Token type
-export interface HtmlToken {
-  type: 'text' | 'tag_open' | 'tag_close' | 'self_closing'
-  tagName?: string
-  attrs?: Record<string, string>
-  content?: string
+export {
+  getHtmlTagFromContent,
+  hasCompleteHtmlTagContent,
+  shouldRenderUnknownHtmlTagAsText,
+  stripCustomHtmlWrapper,
+  tokenizeHtml,
 }
+
+export type { HtmlToken } from 'stream-markdown-parser'
 
 type CreateElementLike = (tag: any, attrs?: Record<string, any>, children?: any[] | undefined) => any
 
@@ -66,185 +82,6 @@ function safeRender(
   return null
 }
 
-// Dangerous attributes that should be filtered out for XSS protection
-const DANGEROUS_ATTRS = new Set([
-  'onclick',
-  'onerror',
-  'onload',
-  'onmouseover',
-  'onmouseout',
-  'onmousedown',
-  'onmouseup',
-  'onkeydown',
-  'onkeyup',
-  'onfocus',
-  'onblur',
-  'onsubmit',
-  'onreset',
-  'onchange',
-  'onselect',
-  'ondblclick',
-  'ontouchstart',
-  'ontouchend',
-  'ontouchmove',
-  'ontouchcancel',
-  'onwheel',
-  'onscroll',
-  'oncopy',
-  'oncut',
-  'onpaste',
-  'oninput',
-  'oninvalid',
-  'onreset',
-  'onsearch',
-  'onsubmit',
-])
-
-// Standard HTML void elements (self-closing)
-const VOID_ELEMENTS = new Set([
-  'area',
-  'base',
-  'br',
-  'col',
-  'embed',
-  'hr',
-  'img',
-  'input',
-  'link',
-  'meta',
-  'param',
-  'source',
-  'track',
-  'wbr',
-])
-
-// Standard HTML tags that should NOT be treated as custom components
-const STANDARD_HTML_TAGS = new Set([
-  'a',
-  'abbr',
-  'address',
-  'area',
-  'article',
-  'aside',
-  'audio',
-  'b',
-  'base',
-  'bdi',
-  'bdo',
-  'blockquote',
-  'body',
-  'br',
-  'button',
-  'canvas',
-  'caption',
-  'cite',
-  'code',
-  'col',
-  'colgroup',
-  'data',
-  'datalist',
-  'dd',
-  'del',
-  'details',
-  'dfn',
-  'dialog',
-  'div',
-  'dl',
-  'dt',
-  'em',
-  'embed',
-  'fieldset',
-  'figcaption',
-  'figure',
-  'footer',
-  'form',
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'head',
-  'header',
-  'hgroup',
-  'hr',
-  'html',
-  'i',
-  'iframe',
-  'img',
-  'input',
-  'ins',
-  'kbd',
-  'label',
-  'legend',
-  'li',
-  'link',
-  'main',
-  'map',
-  'mark',
-  'menu',
-  'meta',
-  'meter',
-  'nav',
-  'noscript',
-  'object',
-  'ol',
-  'optgroup',
-  'option',
-  'output',
-  'p',
-  'param',
-  'picture',
-  'pre',
-  'progress',
-  'q',
-  'rp',
-  'rt',
-  'ruby',
-  's',
-  'samp',
-  'script',
-  'section',
-  'select',
-  'small',
-  'source',
-  'span',
-  'strong',
-  'style',
-  'sub',
-  'summary',
-  'sup',
-  'table',
-  'tbody',
-  'td',
-  'template',
-  'textarea',
-  'tfoot',
-  'th',
-  'thead',
-  'time',
-  'title',
-  'tr',
-  'track',
-  'u',
-  'ul',
-  'var',
-  'video',
-  'wbr',
-])
-
-const CUSTOM_TAG_REGEX = /<([a-z][a-z0-9-]*)\b[^>]*>/gi
-
-const BLOCKED_TAGS = new Set(['script'])
-
-const URL_ATTRS = new Set([
-  'href',
-  'src',
-  'srcset',
-  'xlink:href',
-  'formaction',
-])
-
 const SHOULD_LOG = (() => {
   try {
     return Boolean((import.meta as any).env?.DEV)
@@ -263,226 +100,23 @@ function logError(message: string, err: unknown) {
     console.error(message, err)
 }
 
-function stripControlAndWhitespace(value: string): string {
-  let out = ''
-  for (const ch of value) {
-    const code = ch.charCodeAt(0)
-    if (code <= 0x1F || code === 0x7F)
-      continue
-    if (/\s/u.test(ch))
-      continue
-    out += ch
-  }
-  return out
-}
-
-function isUnsafeUrl(value: string): boolean {
-  const normalized = stripControlAndWhitespace(value).toLowerCase()
-
-  if (normalized.startsWith('javascript:') || normalized.startsWith('vbscript:'))
-    return true
-
-  if (normalized.startsWith('data:')) {
-    return !(
-      normalized.startsWith('data:image/')
-      || normalized.startsWith('data:video/')
-      || normalized.startsWith('data:audio/')
-    )
-  }
-
-  return false
-}
-
-function hasOwn(obj: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(obj, key)
-}
-
-/**
- * Check if a tag name is a custom Vue component
- */
 export function isCustomComponent(
   tagName: string,
   customComponents: Record<string, Component>,
 ): boolean {
-  const lowerTag = tagName.toLowerCase()
-
-  // Fast path: check if it's a standard HTML tag
-  if (STANDARD_HTML_TAGS.has(lowerTag))
-    return false
-
-  // Check if it's registered in custom components (case-insensitive)
-  return hasOwn(customComponents as any, lowerTag) || hasOwn(customComponents as any, tagName)
+  return isCustomHtmlComponentTag(tagName, customComponents as Record<string, unknown>)
 }
 
-/**
- * Sanitize attributes to remove XSS-prone event handlers
- */
 export function sanitizeAttrs(attrs: Record<string, string>): Record<string, string> {
-  const clean: Record<string, string> = {}
-  for (const [key, value] of Object.entries(attrs)) {
-    const lowerKey = key.toLowerCase()
-    if (DANGEROUS_ATTRS.has(lowerKey))
-      continue
-    if (URL_ATTRS.has(lowerKey) && value && isUnsafeUrl(value))
-      continue
-    clean[key] = value
-  }
-  return clean
+  return sanitizeHtmlAttrs(attrs)
 }
 
-/**
- * Convert attribute value to appropriate type
- */
 export function convertPropValue(value: string, key: string): any {
-  const lowerKey = key.toLowerCase()
-
-  // Boolean attributes - HTML5 spec
-  if (['checked', 'disabled', 'readonly', 'required', 'autofocus', 'multiple', 'hidden'].includes(lowerKey))
-    return value === 'true' || value === '' || value === key
-
-  // Numeric attributes
-  if (['value', 'min', 'max', 'step', 'width', 'height', 'size', 'maxlength'].includes(lowerKey)) {
-    const num = Number(value)
-    if (value !== '' && !Number.isNaN(num))
-      return num
-  }
-
-  return value
+  return convertHtmlPropValue(value, key)
 }
 
-/**
- * Convert all attribute values to appropriate types
- */
 export function convertAttrsToProps(attrs: Record<string, string>): Record<string, any> {
-  const result: Record<string, any> = {}
-  for (const [key, value] of Object.entries(attrs))
-    result[key] = convertPropValue(value, key)
-  return result
-}
-
-/**
- * Check if text content is meaningful (not just whitespace)
- */
-function isMeaningfulText(text: string): boolean {
-  return text.trim().length > 0
-}
-
-/**
- * Simple HTML tokenizer
- * Note: This is a basic implementation. For production use with complex HTML,
- * consider using a proper HTML parser library like htmlparser2.
- */
-export function tokenizeHtml(html: string): HtmlToken[] {
-  const tokens: HtmlToken[] = []
-  let pos = 0
-
-  while (pos < html.length) {
-    // Skip HTML comments
-    if (html.startsWith('<!--', pos)) {
-      const commentEnd = html.indexOf('-->', pos)
-      if (commentEnd !== -1) {
-        pos = commentEnd + 3
-        continue
-      }
-      // Unclosed comment, treat rest as text
-      break
-    }
-
-    // Find next tag
-    const tagStart = html.indexOf('<', pos)
-
-    if (tagStart === -1) {
-      // No more tags, add remaining text if meaningful
-      if (pos < html.length) {
-        const remainingText = html.slice(pos)
-        if (isMeaningfulText(remainingText))
-          tokens.push({ type: 'text', content: remainingText })
-      }
-      break
-    }
-
-    // Handle text content before this tag
-    if (tagStart > pos) {
-      const textContent = html.slice(pos, tagStart)
-      if (isMeaningfulText(textContent))
-        tokens.push({ type: 'text', content: textContent })
-    }
-
-    // Handle CDATA sections
-    if (html.startsWith('![CDATA[', tagStart + 1)) {
-      const cdataEnd = html.indexOf(']]>', tagStart)
-      if (cdataEnd !== -1) {
-        tokens.push({ type: 'text', content: html.slice(tagStart, cdataEnd + 3) })
-        pos = cdataEnd + 3
-        continue
-      }
-      // Unclosed CDATA, treat rest as text
-      break
-    }
-
-    // Handle DOCTYPE and other special declarations
-    if (html.startsWith('!', tagStart + 1)) {
-      const specialEnd = html.indexOf('>', tagStart)
-      if (specialEnd !== -1) {
-        pos = specialEnd + 1
-        continue
-      }
-      break
-    }
-
-    // Parse tag
-    const tagEnd = html.indexOf('>', tagStart)
-    if (tagEnd === -1)
-      break // Invalid HTML, abort
-
-    const tagContent = html.slice(tagStart + 1, tagEnd).trim()
-    const isClosingTag = tagContent.startsWith('/')
-    const isSelfClosing = tagContent.endsWith('/')
-
-    if (isClosingTag) {
-      const tagName = tagContent.slice(1).trim()
-      tokens.push({ type: 'tag_close', tagName })
-    }
-    else {
-      // Extract tag name and attributes
-      const spaceIndex = tagContent.indexOf(' ')
-      let tagName: string
-      let attrsStr = ''
-
-      if (spaceIndex === -1) {
-        tagName = isSelfClosing ? tagContent.slice(0, -1).trim() : tagContent.trim()
-      }
-      else {
-        tagName = tagContent.slice(0, spaceIndex).trim()
-        attrsStr = tagContent.slice(spaceIndex + 1)
-      }
-
-      // Parse attributes with better regex
-      const attrs: Record<string, string> = {}
-      if (attrsStr) {
-        const attrRegex = /([^\s=]+)(?:=(?:"([^"]*)"|'([^']*)'|(\S*)))?/g
-        let attrMatch: RegExpExecArray | null
-        while ((attrMatch = attrRegex.exec(attrsStr)) !== null) {
-          const name = attrMatch[1]
-          // Try double quotes, then single quotes, then unquoted
-          const value = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? ''
-          // Filter out trailing slash from self-closing syntax
-          if (name && !name.endsWith('/'))
-            attrs[name] = value
-        }
-      }
-
-      tokens.push({
-        type: isSelfClosing || VOID_ELEMENTS.has(tagName.toLowerCase()) ? 'self_closing' : 'tag_open',
-        tagName,
-        attrs,
-      })
-    }
-
-    pos = tagEnd + 1
-  }
-
-  return tokens
+  return convertHtmlAttrsToProps(attrs)
 }
 
 /**
@@ -591,18 +225,7 @@ export function hasCustomComponents(
   content: string,
   customComponents: Record<string, Component>,
 ): boolean {
-  if (!content || !content.includes('<'))
-    return false
-  if (!customComponents || Object.keys(customComponents).length === 0)
-    return false
-  // Fast path: check for any non-standard tags
-  CUSTOM_TAG_REGEX.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = CUSTOM_TAG_REGEX.exec(content)) !== null) {
-    if (isCustomComponent(match[1], customComponents))
-      return true
-  }
-  return false
+  return hasCustomHtmlComponents(content, customComponents as Record<string, unknown>)
 }
 
 /**

@@ -1,8 +1,24 @@
 import type { Type } from '@angular/core'
 import type { BaseNode, MarkdownIt, ParsedNode, ParseOptions } from 'stream-markdown-parser'
 import type { CodeBlockMonacoOptions, CodeBlockMonacoTheme } from '../../types/monaco'
-import { getMarkdown, parseMarkdownToStructure } from 'stream-markdown-parser'
+import {
+  getHtmlTagFromContent,
+  getMarkdown,
+  hasCompleteHtmlTagContent,
+  normalizeCustomHtmlTags,
+  normalizeCustomHtmlTagName as normalizeTagName,
+  parseMarkdownToStructure,
+  stripCustomHtmlWrapper,
+} from 'stream-markdown-parser'
 import { hydrateCustomTagContent } from '../../hydrateCustomTagContent'
+
+export {
+  getHtmlTagFromContent,
+  hasCompleteHtmlTagContent,
+  normalizeCustomHtmlTags,
+  normalizeTagName,
+  stripCustomHtmlWrapper,
+}
 
 export type AngularRenderableNode = (ParsedNode | BaseNode) & Record<string, unknown>
 
@@ -84,11 +100,9 @@ export interface AngularRenderContext {
 const markdownCache = new Map<string, MarkdownIt>()
 
 export const BLOCK_LEVEL_TYPES = new Set([
-  'image',
   'table',
   'code_block',
   'html_block',
-  'html_inline',
   'blockquote',
   'list',
   'list_item',
@@ -190,35 +204,64 @@ export function getNodeList(value: unknown): AngularRenderableNode[] {
     : []
 }
 
+export function isWhitespaceTextNode(node: AngularRenderableNode | null | undefined) {
+  return getString((node as any)?.type) === 'text' && getString((node as any)?.content).trim() === ''
+}
+
+export function getMeaningfulLinkChildren(node: AngularRenderableNode | null | undefined) {
+  if (getString((node as any)?.type) !== 'link')
+    return []
+
+  return getNodeList((node as any)?.children).filter(child => !isWhitespaceTextNode(child))
+}
+
+export function isImageOnlyLinkNode(node: AngularRenderableNode | null | undefined) {
+  const linkChildren = getMeaningfulLinkChildren(node)
+  return linkChildren.length === 1 && getString((linkChildren[0] as any)?.type) === 'image'
+}
+
+export function isMediaOnlyParagraphNodes(children: readonly AngularRenderableNode[]) {
+  const meaningfulChildren = getNodeList(children).filter(child => !isWhitespaceTextNode(child))
+  return meaningfulChildren.length > 0
+    && meaningfulChildren.every(child => getString((child as any)?.type) === 'image' || isImageOnlyLinkNode(child))
+}
+
+export function normalizeMediaOnlyParagraphNodes(children: readonly AngularRenderableNode[]) {
+  const source = getNodeList(children)
+  const meaningfulChildren = source.filter(child => !isWhitespaceTextNode(child))
+
+  if (!isMediaOnlyParagraphNodes(source) || meaningfulChildren.length <= 1)
+    return source
+
+  const normalized: AngularRenderableNode[] = []
+  for (let index = 0; index < source.length; index += 1) {
+    const child = source[index]
+    if (!isWhitespaceTextNode(child)) {
+      normalized.push(child)
+      continue
+    }
+
+    const hasPrevious = normalized.length > 0
+    const hasNext = source.slice(index + 1).some(nextChild => !isWhitespaceTextNode(nextChild))
+    if (!hasPrevious || !hasNext)
+      continue
+
+    normalized.push({
+      ...(child as Record<string, unknown>),
+      content: ' ',
+      raw: ' ',
+    } as AngularRenderableNode)
+  }
+
+  return normalized
+}
+
 export function getString(value: unknown): string {
   return typeof value === 'string'
     ? value
     : value == null
       ? ''
       : String(value)
-}
-
-export function normalizeCustomHtmlTags(tags?: readonly string[]): string[] {
-  if (!tags || tags.length === 0)
-    return []
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const value = normalizeTagName(tag)
-    if (!value || seen.has(value))
-      continue
-    seen.add(value)
-    normalized.push(value)
-  }
-  return normalized
-}
-
-export function normalizeTagName(value: unknown): string {
-  const raw = getString(value).trim()
-  if (!raw)
-    return ''
-  const match = raw.match(/^[<\s/]*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
 }
 
 export function isSafeAttrName(value: string): boolean {
@@ -249,21 +292,6 @@ export function clampHeadingLevel(value: unknown): number {
 
 export function capitalize(value: string): string {
   return value ? `${value[0].toUpperCase()}${value.slice(1)}` : ''
-}
-
-export function getHtmlTagFromContent(html: unknown) {
-  const raw = String(html ?? '')
-  const match = raw.match(/^\s*<\s*([A-Z][\w:-]*)/i)
-  return match ? match[1].toLowerCase() : ''
-}
-
-export function stripCustomHtmlWrapper(html: unknown, tag: string) {
-  const raw = String(html ?? '')
-  if (!tag)
-    return raw
-  const openRe = new RegExp(String.raw`^\s*<\s*${tag}(?:\s[^>]*)?>\s*`, 'i')
-  const closeRe = new RegExp(String.raw`\s*<\s*\/\s*${tag}\s*>\s*$`, 'i')
-  return raw.replace(openRe, '').replace(closeRe, '')
 }
 
 export function normalizeCodeLanguage(raw: unknown) {
